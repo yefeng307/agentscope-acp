@@ -61,7 +61,10 @@ def main() -> None:
 
     agent = AgentScopeAcpAgent(config)
     try:
-        asyncio.run(run_agent(agent))
+        # session/close and session/resume are flagged unstable by the SDK
+        # and its router drops them unless explicitly enabled (QwenPaw
+        # runs the same flag).
+        asyncio.run(run_agent(agent, use_unstable_protocol=True))
     except KeyboardInterrupt:
         logger.info("interrupted, exiting")
 
