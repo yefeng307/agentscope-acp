@@ -43,7 +43,26 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `AGENTSCOPE_ACP_AVAILABLE_MODELS` | 否 | 同当前模型 | 逗号分隔的模型列表，填充 session/new 的 models |
 | `AGENTSCOPE_ACP_SYSTEM_PROMPT` | 否 | 内置默认 | Agent 系统提示词 |
 | `AGENTSCOPE_ACP_TOOLS` | 否 | 开启 | 是否启用内置工具集；设 `0`/`false`/`no`/`off` 关闭（纯对话无工具） |
+| `AGENTSCOPE_ACP_SKILLS_DIR` | 否 | 关闭 | Agent Skills 目录（含 `SKILL.md` 的目录，见下方 Skill 章节），启用渐进式披露技能 |
 | `AGENTSCOPE_ACP_LOG` | 否 | 关闭 | 文件日志路径（stdout 被 ACP 协议占用，绝不写 stdout） |
+
+## Skill（Agent Skills）
+
+设置 `AGENTSCOPE_ACP_SKILLS_DIR` 指向一个目录，其中的每个子目录是一个标准
+Agent Skill（Anthropic 的 SKILL.md 格式，与 Claude Code / Codex / pi 等生态互通）：
+
+```
+skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
+├── pdf-processing/
+│   ├── SKILL.md         # frontmatter 必填 name + description
+│   └── scripts/...      # 可选资源（相对路径引用）
+└── git-commit-style/
+    └── SKILL.md
+```
+
+AgentScope 的 `LocalSkillLoader` 扫描每个 `SKILL.md`，把 `name`/`description`
+注入系统提示词（渐进式披露：全文本体按需通过内置 `skill_viewer` 工具读取）。
+目录不存在时仅记录警告、按无 skill 启动，不会崩溃。
 
 ## 快速开始
 

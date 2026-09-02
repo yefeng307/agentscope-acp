@@ -28,7 +28,7 @@ from agentscope.types import ReplyFinishedReason
 from pydantic import SecretStr
 
 from agentscope_acp.agent import AgentScopeAcpAgent
-from agentscope_acp.config import AcpConfig, ModelEntry
+from agentscope_acp.config import AcpConfig, ModelEntry, build_toolkit
 
 
 # ----------------------------------------------------------------------
@@ -290,3 +290,32 @@ async def test_prompt_surfaces_tool_call_updates():
     assert first.title == "Bash" and first.kind == "execute"
     last_tool = acp_agent._conn.updates[2][1]
     assert last_tool.status == "completed" and last_tool.raw_output == "out"
+
+
+# ----------------------------------------------------------------------
+# skills configuration
+# ----------------------------------------------------------------------
+
+async def test_from_env_reads_skills_dir(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_SKILLS_DIR", "/tmp/skills")
+    assert AcpConfig.from_env().skills_dir == "/tmp/skills"
+
+
+async def test_build_toolkit_registers_skills_from_dir(tmp_path):
+    skill_dir = tmp_path / "greet"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: greet\ndescription: greet the user politely\n---\n\n"
+        "# Instructions\nSay hello.\n",
+        encoding="utf-8",
+    )
+
+    toolkit = build_toolkit(True, skills_dir=str(tmp_path))
+    instructions = await toolkit.get_skill_instructions() or ""
+    assert "greet" in instructions
+    assert "greet the user politely" in instructions
+
+
+async def test_build_toolkit_ignores_missing_skills_dir(tmp_path):
+    toolkit = build_toolkit(True, skills_dir=str(tmp_path / "nope"))
+    assert await toolkit.get_skill_instructions() is None

@@ -249,7 +249,7 @@ class AgentScopeAcpAgent(Agent):
             name=AGENT_NAME,
             system_prompt=config.system_prompt,
             model=build_chat_model(config),
-            toolkit=build_toolkit(config.enable_tools),
+            toolkit=build_toolkit(config.enable_tools, config.skills_dir),
         )
         configure_permissions(agent, cwd)
         return agent

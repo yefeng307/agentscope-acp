@@ -8,16 +8,20 @@ or a file only.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 
 from pydantic import SecretStr
+
+logger = logging.getLogger(__name__)
 
 ENV_PROVIDER = "AGENTSCOPE_ACP_PROVIDER"
 ENV_MODEL = "AGENTSCOPE_ACP_MODEL"
 ENV_AVAILABLE_MODELS = "AGENTSCOPE_ACP_AVAILABLE_MODELS"
 ENV_SYSTEM_PROMPT = "AGENTSCOPE_ACP_SYSTEM_PROMPT"
 ENV_TOOLS = "AGENTSCOPE_ACP_TOOLS"
+ENV_SKILLS_DIR = "AGENTSCOPE_ACP_SKILLS_DIR"
 ENV_LOG = "AGENTSCOPE_ACP_LOG"
 
 PROVIDER_DASHSCOPE = "dashscope"
@@ -49,6 +53,7 @@ class AcpConfig:
     available_models: list[ModelEntry] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
+    skills_dir: str | None = None
     log_path: str | None = None
 
     @classmethod
@@ -87,6 +92,7 @@ class AcpConfig:
             system_prompt=os.environ.get(ENV_SYSTEM_PROMPT, "").strip()
             or DEFAULT_SYSTEM_PROMPT,
             enable_tools=_parse_bool(os.environ.get(ENV_TOOLS, ""), True),
+            skills_dir=os.environ.get(ENV_SKILLS_DIR, "").strip() or None,
             log_path=os.environ.get(ENV_LOG, "").strip() or None,
         )
 
@@ -107,17 +113,46 @@ def api_key_env_name(provider: str) -> str:
     )
 
 
-def build_toolkit(enable_tools: bool):
+def build_toolkit(
+    enable_tools: bool,
+    skills_dir: str | None = None,
+):
     """Build the built-in coding tool set, or ``None`` for a tool-less agent.
+
+    ``skills_dir`` registers Agent Skills (folders containing a ``SKILL.md``
+    with ``name``/``description`` frontmatter) via
+    ``Toolkit.skills_or_loaders``; see README for the directory layout. A
+    missing directory is ignored with a warning so a stale env value never
+    breaks startup.
 
     Imports are deferred so a tool-less configuration (and the unit tests
     that avoid AgentScope's tool stack) never pay the import cost.
     """
     if not enable_tools:
         return None
+    from agentscope.skill import LocalSkillLoader
     from agentscope.tool import Bash, Edit, Glob, Grep, Read, Toolkit, Write
 
-    return Toolkit(tools=[Bash(), Read(), Write(), Edit(), Grep(), Glob()])
+    skills_or_loaders = None
+    if skills_dir:
+        if os.path.isdir(skills_dir):
+            # scan_subdir=True accepts both layouts: the directory being
+            # one skill itself, or containing multiple skill subdirectories
+            # (the standard Agent Skills ecosystem layout).
+            skills_or_loaders = [
+                LocalSkillLoader(directory=skills_dir, scan_subdir=True),
+            ]
+        else:
+            logger.warning(
+                "skills dir %r does not exist — ignoring %s",
+                skills_dir,
+                ENV_SKILLS_DIR,
+            )
+
+    return Toolkit(
+        tools=[Bash(), Read(), Write(), Edit(), Grep(), Glob()],
+        skills_or_loaders=skills_or_loaders,
+    )
 
 
 def configure_permissions(agent, cwd: str | None) -> None:
