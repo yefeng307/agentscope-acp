@@ -179,6 +179,7 @@ source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },
     { name = "agentscope" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -191,6 +192,7 @@ dev = [
 requires-dist = [
     { name = "agent-client-protocol", specifier = ">=0.9.0,<0.11.0" },
     { name = "agentscope", editable = "../agentscope(ref-backend)" },
+    { name = "pydantic", specifier = ">=2.0" },
 ]
 
 [package.metadata.requires-dev]

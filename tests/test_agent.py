@@ -25,6 +25,7 @@ from agentscope.event import (
 )
 from agentscope.event._event import ToolResultState
 from agentscope.types import ReplyFinishedReason
+from pydantic import SecretStr
 
 from agentscope_acp.agent import AgentScopeAcpAgent
 from agentscope_acp.config import AcpConfig, ModelEntry
@@ -77,7 +78,7 @@ class ForeverAgent:
 def _config() -> AcpConfig:
     return AcpConfig(
         provider="dashscope",
-        api_key="sk-test",
+        api_key=SecretStr("sk-test"),
         model="qwen3.6-plus",
         available_models=[
             ModelEntry(model_id="qwen3.6-plus", name="qwen3.6-plus"),

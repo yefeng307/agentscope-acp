@@ -148,11 +148,15 @@ class TurnTranslator:
             raw_input = "".join(
                 self._tool_inputs.pop(event.tool_call_id, []),
             )
+            # Nothing streamed (no arguments): the start event already
+            # advertised the call, so there is nothing new to update.
+            if not raw_input:
+                return []
             return [
                 update_tool_call(
                     event.tool_call_id,
                     status="in_progress",
-                    raw_input=raw_input or None,
+                    raw_input=raw_input,
                 ),
             ]
 
@@ -168,6 +172,12 @@ class TurnTranslator:
 
         if isinstance(event, ToolResultEndEvent):
             output = "".join(self._tool_outputs.pop(event.tool_call_id, []))
+            # ACP has no "cancelled" ToolCallStatus — an interrupted turn
+            # must not show the tool as failed. The turn-level
+            # stop_reason=cancelled already signals the abort, so skip
+            # the final update for INTERRUPTED results.
+            if event.state == ToolResultState.INTERRUPTED:
+                return []
             failed = event.state != ToolResultState.SUCCESS
             return [
                 update_tool_call(

@@ -240,3 +240,40 @@ class TestToolCallTranslation:
             ),
         )
         assert start[0].kind == "other"
+
+    def test_interrupted_tool_result_is_not_marked_failed(self):
+        translator = TurnTranslator()
+        translator.process(
+            ToolCallStartEvent(
+                reply_id="r1", tool_call_id="c4", tool_call_name="Bash",
+            ),
+        )
+        translator.process(
+            ToolResultTextDeltaEvent(
+                reply_id="r1", tool_call_id="c4", delta="partial",
+            ),
+        )
+        result = translator.process(
+            ToolResultEndEvent(
+                reply_id="r1",
+                tool_call_id="c4",
+                state=ToolResultState.INTERRUPTED,
+            ),
+        )
+        # ACP has no "cancelled" ToolCallStatus: the update is dropped so
+        # an interrupted call is not displayed as "failed" by the client.
+        assert result == []
+
+    def test_tool_call_without_arguments_skips_empty_update(self):
+        translator = TurnTranslator()
+        translator.process(
+            ToolCallStartEvent(
+                reply_id="r1", tool_call_id="c5", tool_call_name="Glob",
+            ),
+        )
+        result = translator.process(
+            ToolCallEndEvent(reply_id="r1", tool_call_id="c5"),
+        )
+        # No argument deltas streamed: the start event already advertised
+        # the call, an empty in_progress update adds nothing.
+        assert result == []

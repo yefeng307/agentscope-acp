@@ -29,7 +29,16 @@ def _setup_logging(config: AcpConfig) -> None:
         "%(asctime)s %(levelname)-7s %(name)s: %(message)s",
     )
     if config.log_path:
-        handler = logging.FileHandler(config.log_path, encoding="utf-8")
+        try:
+            handler = logging.FileHandler(config.log_path, encoding="utf-8")
+        except OSError as exc:
+            # Bad path/permissions must not crash the process at startup.
+            logger.warning(
+                "cannot open log file %r (%s); falling back to stderr",
+                config.log_path,
+                exc,
+            )
+            handler = logging.StreamHandler(sys.stderr)
     else:
         handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(formatter)

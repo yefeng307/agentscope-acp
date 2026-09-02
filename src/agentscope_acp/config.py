@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from pydantic import SecretStr
+
 ENV_PROVIDER = "AGENTSCOPE_ACP_PROVIDER"
 ENV_MODEL = "AGENTSCOPE_ACP_MODEL"
 ENV_AVAILABLE_MODELS = "AGENTSCOPE_ACP_AVAILABLE_MODELS"
@@ -42,7 +44,7 @@ class AcpConfig:
     """Runtime configuration resolved from environment variables."""
 
     provider: str
-    api_key: str
+    api_key: SecretStr
     model: str
     available_models: list[ModelEntry] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -59,9 +61,9 @@ class AcpConfig:
             )
 
         if provider == PROVIDER_DASHSCOPE:
-            api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+            api_key = SecretStr(os.environ.get("DASHSCOPE_API_KEY", ""))
         else:
-            api_key = os.environ.get("OPENAI_API_KEY", "")
+            api_key = SecretStr(os.environ.get("OPENAI_API_KEY", ""))
 
         model = os.environ.get(ENV_MODEL, "").strip() or DEFAULT_MODEL
 
@@ -146,8 +148,6 @@ def build_chat_model(config: AcpConfig):
     the environment. Raises ``ValueError`` with an actionable message when
     the API key is missing — surfaced by the ACP agent as a protocol error.
     """
-    from pydantic import SecretStr
-
     if not config.api_key:
         env_name = api_key_env_name(config.provider)
         raise ValueError(
@@ -155,13 +155,19 @@ def build_chat_model(config: AcpConfig):
             "(agent-work agent_catalog env or shell).",
         )
 
+    key = (
+        config.api_key.get_secret_value()
+        if isinstance(config.api_key, SecretStr)
+        else config.api_key
+    )
+
     if config.provider == PROVIDER_DASHSCOPE:
         from agentscope.credential import DashScopeCredential
         from agentscope.model import DashScopeChatModel
 
         return DashScopeChatModel(
             credential=DashScopeCredential(
-                api_key=SecretStr(config.api_key),
+                api_key=SecretStr(key),
             ),
             model=config.model,
         )
@@ -172,7 +178,7 @@ def build_chat_model(config: AcpConfig):
     base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
     return OpenAIChatModel(
         credential=OpenAICredential(
-            api_key=SecretStr(config.api_key),
+            api_key=SecretStr(key),
             base_url=base_url,
         ),
         model=config.model,
