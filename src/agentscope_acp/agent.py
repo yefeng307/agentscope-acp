@@ -223,13 +223,18 @@ class AgentScopeAcpAgent(Agent):
             session_id = (
                 getattr(state, "session_id", None) or uuid4().hex
             )
-            self._records[session_id] = SessionRecord(
+            record = SessionRecord(
                 agent=agent,
                 cwd=cwd,
                 mcp_clients=clients,
                 updated_at=_now_iso(),
                 model_id=self._config.model,
             )
+            self._records[session_id] = record
+            # Persist immediately: if the client (e.g. Zed) restarts and
+            # kills this process, session/load must still find the session
+            # on disk.
+            self._save_state(record, session_id)
         except ValueError as exc:
             # e.g. missing API key — surface an actionable protocol error.
             logger.error("new_session failed: %s", exc)
@@ -353,10 +358,13 @@ class AgentScopeAcpAgent(Agent):
             return PromptResponse(stop_reason="end_turn")
         finally:
             self._prompt_tasks.pop(session_id, None)
+            # Persist on every path (success, failure, cancel): the client
+            # may be killed at any moment and session/load after a restart
+            # depends on this file existing.
+            record.updated_at = _now_iso()
+            self._save_state(record, session_id)
 
         await self._send_usage(session_id, translator, record.agent)
-        record.updated_at = _now_iso()
-        self._save_state(record, session_id)
 
         logger.info(
             "prompt finished: session=%s stop_reason=%s tokens(in/out)=%d/%d",
@@ -400,19 +408,40 @@ class AgentScopeAcpAgent(Agent):
         cursor: str | None = None,
         **kwargs: Any,
     ) -> ListSessionsResponse:
-        sessions = []
+        sessions: dict[str, SessionInfo] = {}
         for session_id, record in self._records.items():
-            if cwd and record.cwd != cwd:
-                continue
-            sessions.append(
-                SessionInfo(
-                    session_id=session_id,
-                    cwd=record.cwd,
-                    title=record.title,
-                    updated_at=record.updated_at,
-                ),
+            sessions[session_id] = SessionInfo(
+                session_id=session_id,
+                cwd=record.cwd,
+                title=record.title,
+                updated_at=record.updated_at,
             )
-        return ListSessionsResponse(sessions=sessions)
+        # Merge persisted sessions from disk so the table survives a
+        # process restart (in-memory records are empty after the client
+        # kills us).
+        sessions_dir = sessions_path(self._config)
+        if sessions_dir.is_dir():
+            for path in sessions_dir.glob("*.json"):
+                session_id = path.stem
+                if session_id in sessions:
+                    continue
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                    meta = raw.get("_acp_meta", {})
+                except Exception:
+                    continue
+                sessions[session_id] = SessionInfo(
+                    session_id=session_id,
+                    cwd=meta.get("cwd", ""),
+                    title=meta.get("title"),
+                    updated_at=meta.get("updated_at") or _now_iso(),
+                )
+        result = [
+            info
+            for info in sessions.values()
+            if not cwd or info.cwd == cwd
+        ]
+        return ListSessionsResponse(sessions=result)
 
     async def close_session(  # pylint: disable=unused-argument
         self,
@@ -566,12 +595,25 @@ class AgentScopeAcpAgent(Agent):
         return sessions_path(self._config) / f"{session_id}.json"
 
     def _save_state(self, record: SessionRecord, session_id: str) -> None:
-        """Persist the agent state to disk (best-effort)."""
+        """Persist the agent state to disk (best-effort).
+
+        The engine's AgentState is saved together with a small `_acp_meta`
+        block (cwd/title/timestamps) so `list_sessions` can rebuild the
+        session table after a process restart (extra keys are ignored by
+        AgentState.model_validate).
+        """
         try:
             path = self._state_path(session_id)
             path.parent.mkdir(parents=True, exist_ok=True)
+            payload = json.loads(record.agent.state.model_dump_json())
+            payload["_acp_meta"] = {
+                "cwd": record.cwd,
+                "title": record.title,
+                "updated_at": record.updated_at,
+                "model_id": record.model_id,
+            }
             path.write_text(
-                record.agent.state.model_dump_json(),
+                json.dumps(payload, ensure_ascii=False),
                 encoding="utf-8",
             )
         except Exception:

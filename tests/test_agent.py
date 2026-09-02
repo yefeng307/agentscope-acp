@@ -144,6 +144,16 @@ def _make_agent(
     return acp_agent
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sessions(tmp_path, monkeypatch):
+    """Point all session persistence at a per-test temp dir so tests
+    never touch the real ~/.agentscope-acp/sessions."""
+    monkeypatch.setattr(
+        "agentscope_acp.agent.sessions_path",
+        lambda config: tmp_path,
+    )
+
+
 # ----------------------------------------------------------------------
 # initialize / new_session
 # ----------------------------------------------------------------------
@@ -625,6 +635,65 @@ async def test_load_session_missing_raises(tmp_path):
     acp_agent.on_connect(RecordingConn())
     with pytest.raises(RequestError):
         await acp_agent.load_session(cwd="/tmp", session_id="ghost")
+
+
+async def test_new_session_persists_immediately(tmp_path):
+    """The session file must exist right after session/new so a client
+    restart (which kills this process) can still session/load it."""
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    saved = tmp_path / f"{session.session_id}.json"
+    assert saved.exists()
+    raw = json.loads(saved.read_text(encoding="utf-8"))
+    assert raw["session_id"] == session.session_id
+    assert raw["_acp_meta"]["cwd"] == "/tmp"
+
+
+async def test_prompt_failure_still_persists(tmp_path):
+    """A failed prompt turn must still persist state — the process may be
+    killed right after and session/load depends on the file existing."""
+    fake = FakeAgentScopeAgent(error=RuntimeError("boom"))
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.prompt(
+        prompt=_prompt_blocks("hi"),
+        session_id=session.session_id,
+    )
+    assert response.stop_reason == "end_turn"
+
+    saved = tmp_path / f"{session.session_id}.json"
+    assert saved.exists()
+    raw = json.loads(saved.read_text(encoding="utf-8"))
+    assert raw["session_id"] == session.session_id
+
+
+async def test_list_sessions_includes_disk_sessions(tmp_path):
+    """After a process restart the in-memory table is empty; the session
+    list must still surface sessions persisted on disk."""
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    # Simulate a restart: fresh agent instance, empty in-memory table.
+    fresh = _make_agent(FakeAgentScopeAgent())
+    response = await fresh.list_sessions()
+
+    ids = [s.session_id for s in response.sessions]
+    assert session.session_id in ids
+    info = next(s for s in response.sessions if s.session_id == session.session_id)
+    assert info.cwd == "/tmp"
+
+
+async def test_list_sessions_filters_by_cwd(tmp_path):
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    await acp_agent.new_session(cwd="/project/a")
+    await acp_agent.new_session(cwd="/project/b")
+
+    response = await acp_agent.list_sessions(cwd="/project/b")
+
+    assert len(response.sessions) == 1
+    assert response.sessions[0].cwd == "/project/b"
 
 
 async def test_list_sessions_reports_open_sessions():
