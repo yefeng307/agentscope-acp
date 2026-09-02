@@ -17,9 +17,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from acp import (
@@ -67,7 +69,6 @@ from .translate import (
     TurnTranslator,
     _tool_kind,
     agent_message_chunk,
-    extract_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,10 +107,20 @@ def _confirm_result(tool_call: Any, outcome: Any) -> ConfirmResult:
     ``selected`` + allow_* -> confirmed (with a permanent PermissionRule for
     ``allow_always``); ``selected`` + reject_*/unknown or ``cancelled`` ->
     rejected.
+
+    Two shapes are accepted: the SDK's ``ClientConnection.request_permission``
+    returns a ``RequestPermissionResponse`` whose ``.outcome`` is the
+    AllowedOutcome/DeniedOutcome model, while simplified clients/tests may
+    hand back the bare outcome model directly.
     """
-    if getattr(outcome, "outcome", None) != "selected":
+    selected = getattr(outcome, "outcome", None)
+    option_id = getattr(outcome, "option_id", None)
+    if selected is not None and hasattr(selected, "outcome"):
+        # Nested wrapper: RequestPermissionResponse.outcome -> AllowedOutcome.
+        option_id = getattr(selected, "option_id", None)
+        selected = getattr(selected, "outcome", None)
+    if selected != "selected":
         return ConfirmResult(confirmed=False, tool_call=tool_call)
-    option_id = getattr(outcome, "option_id", "")
     rules = None
     if option_id in ("allow_always", "reject_always"):
         behavior = (
@@ -127,6 +138,28 @@ def _confirm_result(tool_call: Any, outcome: Any) -> ConfirmResult:
         ]
     confirmed = option_id in ("allow_once", "allow_always")
     return ConfirmResult(confirmed=confirmed, tool_call=tool_call, rules=rules)
+
+
+def _uri_to_path(uri: str) -> str:
+    """Convert a ``file://`` URI to an absolute local path.
+
+    ``fs/read_text_file`` expects an absolute path, while clients such as
+    Zed reference @mentioned files in resource links as URIs. Non-file
+    URIs and plain paths are passed through unchanged.
+    """
+    parsed = urlparse(uri)
+    if parsed.scheme != "file":
+        return uri
+    path = unquote(parsed.path)
+    if os.name == "nt":
+        netloc = parsed.netloc
+        if len(netloc) == 2 and netloc[1] == ":" and netloc[0].isalpha():
+            # file://D:/x — the drive letter lands in the netloc.
+            path = netloc + path
+        elif len(path) >= 3 and path[0] == "/" and path[2] == ":":
+            # file:///D:/x — drop the leading slash.
+            path = path[1:]
+    return path
 
 
 @dataclass
@@ -171,6 +204,7 @@ class AgentScopeAcpAgent(Agent):
         self._agent_factory = agent_factory or self._default_agent_factory
         self._records: dict[str, SessionRecord] = {}
         self._prompt_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._client_capabilities: Any | None = None
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -186,6 +220,7 @@ class AgentScopeAcpAgent(Agent):
         client_info: Any | None = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        self._client_capabilities = client_capabilities
         logger.info(
             "initialize: protocol_version=%s client_info=%s",
             protocol_version,
@@ -294,6 +329,68 @@ class AgentScopeAcpAgent(Agent):
             config_options=self._build_config_options(self._config.model),
         )
 
+    async def _resolve_prompt_text(
+        self,
+        session_id: str,
+        prompt: list[Any],
+    ) -> str:
+        """Extract text from ACP content blocks, resolving resource links.
+
+        Clients such as Zed send @file mentions as ``resource_link`` blocks
+        carrying only a URI; the protocol expects the agent to fetch the
+        content itself through ``fs/read_text_file`` (gated on the client's
+        ``fs.readTextFile`` capability). Embedded ``resource`` blocks are
+        included verbatim. Resolution failures are best-effort — an
+        unreadable link is skipped instead of failing the whole prompt.
+        """
+        parts: list[str] = []
+        for block in prompt or []:
+            kind = getattr(block, "type", None)
+            if kind == "text":
+                text = getattr(block, "text", None)
+                if isinstance(text, str) and text:
+                    parts.append(text)
+                continue
+            if kind == "resource":
+                resource = getattr(block, "resource", None)
+                text = getattr(resource, "text", None)
+                if isinstance(text, str) and text:
+                    parts.append(text)
+                continue
+            if kind == "resource_link":
+                name = getattr(block, "name", None) or "file"
+                uri = getattr(block, "uri", None)
+                if not isinstance(uri, str):
+                    continue
+                fs_caps = getattr(self._client_capabilities, "fs", None)
+                if not getattr(fs_caps, "read_text_file", None):
+                    logger.debug(
+                        "client does not support fs/read_text_file; "
+                        "skipping resource link: uri=%s",
+                        uri,
+                    )
+                    continue
+                try:
+                    response = await self._conn.read_text_file(
+                        session_id,
+                        _uri_to_path(uri),
+                    )
+                    content = getattr(response, "content", None)
+                except Exception:
+                    logger.warning(
+                        "failed to resolve resource link: uri=%s",
+                        uri,
+                        exc_info=True,
+                    )
+                    continue
+                if isinstance(content, str) and content:
+                    parts.append(
+                        f"<attached_file name={name!r}>\n"
+                        f"{content}\n"
+                        f"</attached_file>"
+                    )
+        return "\n".join(parts)
+
     async def prompt(  # pylint: disable=unused-argument
         self,
         prompt: list[Any],
@@ -307,7 +404,7 @@ class AgentScopeAcpAgent(Agent):
                 {"details": f"Unknown session: {session_id!r}"},
             )
 
-        text = extract_text(prompt)
+        text = await self._resolve_prompt_text(session_id, prompt)
         if not text:
             return PromptResponse(stop_reason="end_turn")
 

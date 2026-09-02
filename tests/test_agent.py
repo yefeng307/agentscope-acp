@@ -8,11 +8,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 import pytest
 from acp.exceptions import RequestError
-from acp.schema import AllowedOutcome, TextContentBlock
+from acp.schema import (
+    AllowedOutcome,
+    ClientCapabilities,
+    EmbeddedResourceContentBlock,
+    FileSystemCapabilities,
+    ReadTextFileResponse,
+    RequestPermissionResponse,
+    ResourceContentBlock,
+    TextContentBlock,
+    TextResourceContents,
+)
 from agentscope.event import (
     ModelCallEndEvent,
     ReplyEndEvent,
@@ -32,7 +43,7 @@ from agentscope.state import AgentState
 from agentscope.types import ReplyFinishedReason
 from pydantic import SecretStr
 
-from agentscope_acp.agent import AgentScopeAcpAgent
+from agentscope_acp.agent import AgentScopeAcpAgent, _uri_to_path
 from agentscope_acp.config import AcpConfig, ModelEntry, build_toolkit
 
 
@@ -43,10 +54,16 @@ from agentscope_acp.config import AcpConfig, ModelEntry, build_toolkit
 class RecordingConn:
     """Fake ``acp.interfaces.Client`` recording session_update calls."""
 
-    def __init__(self, permission_outcomes: list[Any] | None = None) -> None:
+    def __init__(
+        self,
+        permission_outcomes: list[Any] | None = None,
+        file_contents: dict[str, str] | None = None,
+    ) -> None:
         self.updates: list[tuple[str, Any]] = []
         self.permission_requests: list[tuple[str, Any, list[Any]]] = []
+        self.read_requests: list[tuple[str, str]] = []
         self._outcomes = list(permission_outcomes or [])
+        self._file_contents = dict(file_contents or {})
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         self.updates.append((session_id, update))
@@ -61,7 +78,25 @@ class RecordingConn:
         self.permission_requests.append((session_id, tool_call, options))
         if self._outcomes:
             return self._outcomes.pop(0)
-        return AllowedOutcome(outcome="selected", option_id="allow_once")
+        # Real clients wrap the outcome: RequestPermissionResponse.outcome is
+        # the AllowedOutcome model (verified against a Zed capture). Use that
+        # shape by default so _confirm_result's nesting handling is exercised.
+        return RequestPermissionResponse(
+            outcome=AllowedOutcome(outcome="selected", option_id="allow_once"),
+        )
+
+    async def read_text_file(
+        self,
+        session_id: str,
+        path: str,
+        line: int | None = None,
+        limit: int | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.read_requests.append((session_id, path))
+        # Unknown paths raise KeyError, exercising the resolver's
+        # best-effort failure path.
+        return ReadTextFileResponse(content=self._file_contents[path])
 
 
 class FakeAgentScopeAgent:
@@ -121,6 +156,14 @@ def _config() -> AcpConfig:
 
 def _prompt_blocks(text: str) -> list[TextContentBlock]:
     return [TextContentBlock(type="text", text=text)]
+
+
+def _received_text(user_msg: Any) -> str:
+    """Flatten a UserMsg's text blocks into plain text."""
+    return "".join(
+        getattr(block, "text", None) or ""
+        for block in (getattr(user_msg, "content", None) or [])
+    )
 
 
 def _stream_events() -> list[Any]:
@@ -544,6 +587,136 @@ async def test_prompt_cancelled_permission_is_rejection():
 
     resume = fake.received[1]
     assert resume.confirm_results[0].confirmed is False
+
+
+async def test_prompt_permission_nested_response_shape():
+    """Real clients wrap the outcome: RequestPermissionResponse.outcome is the
+    AllowedOutcome model (verified against a Zed capture)."""
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[
+            RequestPermissionResponse(
+                outcome=AllowedOutcome(
+                    outcome="selected",
+                    option_id="allow_once",
+                ),
+            ),
+        ],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is True
+
+
+# ----------------------------------------------------------------------
+# prompt content resolution (@file / resource blocks)
+# ----------------------------------------------------------------------
+
+def test_uri_to_path_converts_file_uris():
+    if os.name == "nt":
+        assert _uri_to_path("file:///D:/proj/x.txt") == "D:/proj/x.txt"
+        assert _uri_to_path("file://D:/proj/x.txt") == "D:/proj/x.txt"
+    else:
+        assert _uri_to_path("file:///home/u/x.txt") == "/home/u/x.txt"
+    # Non-file URIs pass through unchanged.
+    assert _uri_to_path("https://example.com/x.txt") == "https://example.com/x.txt"
+
+
+def _fs_enabled() -> ClientCapabilities:
+    return ClientCapabilities(
+        fs=FileSystemCapabilities(read_text_file=True),
+    )
+
+
+async def test_prompt_resolves_resource_link_and_embedded_resource():
+    fake = FakeAgentScopeAgent(_stream_events())
+    acp_agent = _make_agent(fake)
+    acp_agent._client_capabilities = _fs_enabled()
+    conn = acp_agent._conn
+    conn._file_contents[_uri_to_path("file:///D:/proj/x.txt")] = "file body"
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=[
+            TextContentBlock(type="text", text="look at this"),
+            ResourceContentBlock(
+                type="resource_link",
+                uri="file:///D:/proj/x.txt",
+                name="x.txt",
+            ),
+            EmbeddedResourceContentBlock(
+                type="resource",
+                resource=TextResourceContents(
+                    text="inline content",
+                    uri="file:///D:/proj/inline.txt",
+                ),
+            ),
+        ],
+        session_id=session.session_id,
+    )
+
+    assert len(conn.read_requests) == 1
+    request_session, path = conn.read_requests[0]
+    assert request_session == session.session_id
+    assert path.endswith("D:/proj/x.txt")
+    user_text = _received_text(fake.received[0])
+    assert "look at this" in user_text
+    assert "file body" in user_text
+    assert "inline content" in user_text
+
+
+async def test_prompt_skips_unresolvable_resource_link():
+    fake = FakeAgentScopeAgent(_stream_events())
+    acp_agent = _make_agent(fake)
+    acp_agent._client_capabilities = _fs_enabled()
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.prompt(
+        prompt=[
+            TextContentBlock(type="text", text="hello"),
+            ResourceContentBlock(
+                type="resource_link",
+                uri="file:///D:/missing.txt",
+                name="missing.txt",
+            ),
+        ],
+        session_id=session.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    assert _received_text(fake.received[0]) == "hello"
+
+
+async def test_prompt_skips_resource_link_without_fs_capability():
+    fake = FakeAgentScopeAgent(_stream_events())
+    acp_agent = _make_agent(fake)
+    conn = acp_agent._conn
+    conn._file_contents[_uri_to_path("file:///D:/proj/x.txt")] = "file body"
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=[
+            TextContentBlock(type="text", text="hello"),
+            ResourceContentBlock(
+                type="resource_link",
+                uri="file:///D:/proj/x.txt",
+                name="x.txt",
+            ),
+        ],
+        session_id=session.session_id,
+    )
+
+    # Without client fs capability the link must not be resolved.
+    assert conn.read_requests == []
+    assert _received_text(fake.received[0]) == "hello"
 
 
 # ----------------------------------------------------------------------
