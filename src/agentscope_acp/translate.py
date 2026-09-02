@@ -114,6 +114,9 @@ class TurnTranslator:
         # event so clients receive one compact update each.
         self._tool_inputs: dict[str, list[str]] = {}
         self._tool_outputs: dict[str, list[str]] = {}
+        # Complete tool args keyed by tool_call_id, kept after the
+        # in_progress update so the terminal update can repeat them.
+        self._tool_inputs_done: dict[str, str] = {}
 
     @property
     def total_tokens(self) -> int:
@@ -174,6 +177,7 @@ class TurnTranslator:
             # advertised the call, so there is nothing new to update.
             if not raw_input:
                 return []
+            self._tool_inputs_done[event.tool_call_id] = raw_input
             return [
                 update_tool_call(
                     event.tool_call_id,
@@ -199,12 +203,20 @@ class TurnTranslator:
             # stop_reason=cancelled already signals the abort, so skip
             # the final update for INTERRUPTED results.
             if event.state == ToolResultState.INTERRUPTED:
+                self._tool_inputs_done.pop(event.tool_call_id, None)
                 return []
             failed = event.state != ToolResultState.SUCCESS
             return [
                 update_tool_call(
                     event.tool_call_id,
                     status="failed" if failed else "completed",
+                    # Repeat the args on the terminal update: clients that
+                    # only render raw_input on completed tool cards (Zed)
+                    # would otherwise never show the command.
+                    raw_input=self._tool_inputs_done.pop(
+                        event.tool_call_id,
+                        None,
+                    ),
                     content=(
                         [tool_content(text_block(output))] if output else None
                     ),

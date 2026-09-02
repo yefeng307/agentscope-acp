@@ -411,6 +411,9 @@ async def test_prompt_surfaces_tool_call_updates():
     assert first.title == "Bash" and first.kind == "execute"
     last_tool = acp_agent._conn.updates[2][1]
     assert last_tool.status == "completed" and last_tool.raw_output == "out"
+    # The terminal update repeats the args so clients that only render
+    # raw_input on completed tool cards still show the command.
+    assert last_tool.raw_input == "ls"
 
 
 # ----------------------------------------------------------------------
