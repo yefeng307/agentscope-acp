@@ -658,7 +658,17 @@ class AgentScopeAcpAgent(Agent):
         record = self._records.pop(session_id, None)
         if record is None:
             return
-        self._save_state(record, session_id)
+        # session/close means the client discarded the session: drop the
+        # persisted state too, otherwise session/list resurrects it after
+        # a process restart.
+        try:
+            self._state_path(session_id).unlink(missing_ok=True)
+        except OSError:
+            logger.warning(
+                "failed to remove session file: session=%s",
+                session_id,
+                exc_info=True,
+            )
         for client in record.mcp_clients:
             if client.is_stateful:
                 try:

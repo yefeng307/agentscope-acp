@@ -912,12 +912,16 @@ async def test_list_sessions_reports_open_sessions():
     assert info.updated_at is not None
 
 
-async def test_close_session_removes_record():
+async def test_close_session_removes_record(tmp_path):
     acp_agent = _make_agent(FakeAgentScopeAgent())
     session = await acp_agent.new_session(cwd="/tmp")
 
     await acp_agent.close_session(session_id=session.session_id)
+
     assert acp_agent._records == {}
+    # The persisted state is dropped too — session/list must not
+    # resurrect a closed session after a restart.
+    assert not (tmp_path / f"{session.session_id}.json").exists()
 
 
 async def test_resume_session_reuses_inmemory_record():
