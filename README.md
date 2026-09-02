@@ -32,6 +32,7 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | 权限审批 | ✅ | `request_permission` 四选项（本次/永久放行、本次/永久拒绝）→ 永久项转 PermissionRule 回传引擎 |
 | 思考流 | ✅ | ThinkingBlockDeltaEvent → `agent_thought_chunk`（不污染正文） |
 | 会话持久化 | ✅ | AgentState → 本地 JSON；`session/load` 恢复（声明 load_session 能力） |
+| @文件引用 | ✅ | `resource_link` 块经 `fs/read_text_file` 拉取内容（按客户端 fs 能力门控）；`resource` 内嵌块直接纳入正文；解析失败跳过不阻断 |
 | 模型切换 | ✅ | `session/set_config_option` 运行时换模型（响应回传新配置） |
 | usage 统计 | ✅ | 每轮 `usage_update`（输入+输出 token） |
 | `session/list` / `close` | ✅ | 列表（cwd 过滤）/ 关闭（保存状态 + 断开 MCP） |
@@ -79,7 +80,7 @@ cd agentscope-acp
 uv sync
 ```
 
-依赖中的 `agentscope` 使用官方 PyPI 发布版（`2.0.7.post1`），不依赖本地源码树。
+依赖中的 `agentscope` 使用官方 PyPI 发布版（`2.0.7.post1`）
 
 ### 冒烟测试
 
@@ -92,7 +93,7 @@ OPENAI_API_KEY=sk-... uv run agentscope-acp <<'EOF'
 EOF
 ```
 
-## agent-work 接入（不改前端代码）
+## agent-work 接入
 
 agent-work 的 ACP Client 链路已完备（AcpDriver → AcpAgentTask → probe 预取模型），
 安装本包后添加一个自定义 Agent（设置页「自定义 Agent」或 agent_catalog 种子）：
