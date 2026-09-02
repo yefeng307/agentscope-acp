@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+.venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+
+# uv
+# uv.lock is tracked for reproducible installs

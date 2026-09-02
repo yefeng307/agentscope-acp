@@ -1,0 +1,33 @@
+[project]
+name = "agentscope-acp"
+version = "0.1.0"
+description = "ACP (Agent Client Protocol) agent for AgentScope — exposes an in-process AgentScope Agent over stdio JSON-RPC so ACP clients (agent-work, Zed, ...) can drive it."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "agent-client-protocol>=0.9.0,<0.11.0",
+    "agentscope",
+]
+
+[project.scripts]
+agentscope-acp = "agentscope_acp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentscope_acp"]
+
+[tool.uv.sources]
+agentscope = { path = "../agentscope(ref-backend)", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
