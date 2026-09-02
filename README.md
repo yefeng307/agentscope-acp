@@ -43,6 +43,7 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `AGENTSCOPE_ACP_AVAILABLE_MODELS` | 否 | 同当前模型 | 逗号分隔的模型列表，填充 session/new 的 models |
 | `AGENTSCOPE_ACP_SYSTEM_PROMPT` | 否 | 内置默认 | Agent 系统提示词 |
 | `AGENTSCOPE_ACP_TOOLS` | 否 | 开启 | 是否启用内置工具集；设 `0`/`false`/`no`/`off` 关闭（纯对话无工具） |
+| `AGENTSCOPE_ACP_TOOL_NAMES` | 否 | `Bash,Read,Write,Edit,Grep,Glob` | 工具白名单（逗号分隔类名，可选加 `PowerShell`）；引擎新增工具时改这里即可启用，无需发版 |
 | `AGENTSCOPE_ACP_SKILLS_DIR` | 否 | 关闭 | Agent Skills 目录（含 `SKILL.md` 的目录，见下方 Skill 章节），启用渐进式披露技能 |
 | `AGENTSCOPE_ACP_LOG` | 否 | 关闭 | 文件日志路径（stdout 被 ACP 协议占用，绝不写 stdout） |
 

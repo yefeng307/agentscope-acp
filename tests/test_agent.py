@@ -319,3 +319,29 @@ async def test_build_toolkit_registers_skills_from_dir(tmp_path):
 async def test_build_toolkit_ignores_missing_skills_dir(tmp_path):
     toolkit = build_toolkit(True, skills_dir=str(tmp_path / "nope"))
     assert await toolkit.get_skill_instructions() is None
+
+
+# ----------------------------------------------------------------------
+# tool whitelist configuration
+# ----------------------------------------------------------------------
+
+async def test_from_env_reads_tool_names(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_TOOL_NAMES", "Bash, Read")
+    assert AcpConfig.from_env().tool_names == ["Bash", "Read"]
+
+
+async def test_build_toolkit_whitelist_selects_tools():
+    toolkit = build_toolkit(True, tool_names=["Read", "PowerShell"])
+    names = [t.name for t in toolkit.tool_groups[0].tools]
+    assert names == ["Read", "PowerShell"]
+
+
+async def test_build_toolkit_unknown_tool_is_skipped():
+    toolkit = build_toolkit(True, tool_names=["Nope"])
+    assert toolkit.tool_groups[0].tools == []
+
+
+async def test_build_toolkit_default_set():
+    toolkit = build_toolkit(True)
+    names = [t.name for t in toolkit.tool_groups[0].tools]
+    assert names == ["Bash", "Read", "Write", "Edit", "Grep", "Glob"]

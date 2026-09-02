@@ -21,6 +21,7 @@ ENV_MODEL = "AGENTSCOPE_ACP_MODEL"
 ENV_AVAILABLE_MODELS = "AGENTSCOPE_ACP_AVAILABLE_MODELS"
 ENV_SYSTEM_PROMPT = "AGENTSCOPE_ACP_SYSTEM_PROMPT"
 ENV_TOOLS = "AGENTSCOPE_ACP_TOOLS"
+ENV_TOOL_NAMES = "AGENTSCOPE_ACP_TOOL_NAMES"
 ENV_SKILLS_DIR = "AGENTSCOPE_ACP_SKILLS_DIR"
 ENV_LOG = "AGENTSCOPE_ACP_LOG"
 
@@ -28,6 +29,13 @@ PROVIDER_DASHSCOPE = "dashscope"
 PROVIDER_OPENAI_COMPAT = "openai-compat"
 
 DEFAULT_MODEL = "qwen3.6-plus"
+
+# The default tool set. Explicit by design: the tool set is the agent's
+# capability boundary (Bash/Write carry permission implications), and the
+# ACP translation layer maps tool names onto ToolKinds. New tools are
+# opt-in via AGENTSCOPE_ACP_TOOL_NAMES rather than silently gained on an
+# engine upgrade.
+DEFAULT_TOOL_NAMES = ("Bash", "Read", "Write", "Edit", "Grep", "Glob")
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant powered by AgentScope. "
@@ -53,6 +61,7 @@ class AcpConfig:
     available_models: list[ModelEntry] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
+    tool_names: list[str] | None = None
     skills_dir: str | None = None
     log_path: str | None = None
 
@@ -84,6 +93,12 @@ class AcpConfig:
         if model not in {e.model_id for e in entries}:
             entries.insert(0, ModelEntry(model_id=model, name=model))
 
+        raw_names = os.environ.get(ENV_TOOL_NAMES, "").strip()
+        tool_names = (
+            [part.strip() for part in raw_names.split(",") if part.strip()]
+            or None
+        )
+
         return cls(
             provider=provider,
             api_key=api_key,
@@ -92,6 +107,7 @@ class AcpConfig:
             system_prompt=os.environ.get(ENV_SYSTEM_PROMPT, "").strip()
             or DEFAULT_SYSTEM_PROMPT,
             enable_tools=_parse_bool(os.environ.get(ENV_TOOLS, ""), True),
+            tool_names=tool_names,
             skills_dir=os.environ.get(ENV_SKILLS_DIR, "").strip() or None,
             log_path=os.environ.get(ENV_LOG, "").strip() or None,
         )
@@ -116,8 +132,15 @@ def api_key_env_name(provider: str) -> str:
 def build_toolkit(
     enable_tools: bool,
     skills_dir: str | None = None,
+    tool_names: list[str] | None = None,
 ):
     """Build the built-in coding tool set, or ``None`` for a tool-less agent.
+
+    ``tool_names`` is a whitelist of built-in tool class names; ``None``
+    (default) enables :data:`DEFAULT_TOOL_NAMES`. Unknown names are warned
+    and skipped, so new AgentScope tools can be opted in via
+    ``AGENTSCOPE_ACP_TOOL_NAMES`` without a code change — they are never
+    enabled implicitly.
 
     ``skills_dir`` registers Agent Skills (folders containing a ``SKILL.md``
     with ``name``/``description`` frontmatter) via
@@ -131,7 +154,41 @@ def build_toolkit(
     if not enable_tools:
         return None
     from agentscope.skill import LocalSkillLoader
-    from agentscope.tool import Bash, Edit, Glob, Grep, Read, Toolkit, Write
+    from agentscope.tool import (
+        Bash,
+        Edit,
+        Glob,
+        Grep,
+        PowerShell,
+        Read,
+        Toolkit,
+        Write,
+    )
+
+    # Tool-name registry. Task* tools are intentionally absent: they drive
+    # AgentScope's internal task system, not ACP-facing workflows.
+    _TOOL_CLASSES = {
+        "Bash": Bash,
+        "PowerShell": PowerShell,
+        "Read": Read,
+        "Write": Write,
+        "Edit": Edit,
+        "Grep": Grep,
+        "Glob": Glob,
+    }
+
+    names = list(tool_names) if tool_names else list(DEFAULT_TOOL_NAMES)
+    tools = []
+    for name in names:
+        cls = _TOOL_CLASSES.get(name)
+        if cls is None:
+            logger.warning(
+                "unknown tool %r — skipping (available: %s)",
+                name,
+                ", ".join(_TOOL_CLASSES),
+            )
+            continue
+        tools.append(cls())
 
     skills_or_loaders = None
     if skills_dir:
@@ -150,7 +207,7 @@ def build_toolkit(
             )
 
     return Toolkit(
-        tools=[Bash(), Read(), Write(), Edit(), Grep(), Glob()],
+        tools=tools,
         skills_or_loaders=skills_or_loaders,
     )
 
