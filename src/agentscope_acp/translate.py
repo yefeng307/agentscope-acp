@@ -8,13 +8,14 @@ model or ACP client.
 
 Mapping (see README Roadmap for the rest):
 
-- ``TextBlockDeltaEvent``    -> ``agent_message_chunk`` (streamed text)
-- ``ToolCallStartEvent``     -> ``tool_call`` (tool starts, in_progress)
-- ``ToolCallEndEvent``       -> ``tool_call_update`` (args complete)
-- ``ToolResultEndEvent``     -> ``tool_call_update`` (completed/failed)
-- ``ReplyEndEvent``          -> turn-stop reason for ``PromptResponse``
-- ``ModelCallEndEvent``      -> token accounting (logged only)
-- thinking / result deltas   -> buffered and flushed on the end event
+- ``TextBlockDeltaEvent``     -> ``agent_message_chunk`` (streamed text)
+- ``ThinkingBlockDeltaEvent`` -> ``agent_thought_chunk`` (reasoning stream)
+- ``ToolCallStartEvent``      -> ``tool_call`` (tool starts, in_progress)
+- ``ToolCallEndEvent``        -> ``tool_call_update`` (args complete)
+- ``ToolResultEndEvent``      -> ``tool_call_update`` (completed/failed)
+- ``ReplyEndEvent``           -> turn-stop reason for ``PromptResponse``
+- ``ModelCallEndEvent``       -> token accounting (usage_update)
+- result deltas               -> buffered and flushed on the end event
 """
 from __future__ import annotations
 
@@ -22,12 +23,13 @@ import logging
 from typing import Any
 
 from acp import start_tool_call, text_block, tool_content, update_tool_call
-from acp.schema import AgentMessageChunk
+from acp.schema import AgentMessageChunk, AgentThoughtChunk
 
 from agentscope.event import (
     ModelCallEndEvent,
     ReplyEndEvent,
     TextBlockDeltaEvent,
+    ThinkingBlockDeltaEvent,
     ToolCallDeltaEvent,
     ToolCallEndEvent,
     ToolCallStartEvent,
@@ -85,6 +87,15 @@ def agent_message_chunk(message_id: str, text: str) -> AgentMessageChunk:
     )
 
 
+def agent_thought_chunk(message_id: str, text: str) -> AgentThoughtChunk:
+    """Build an ``agent_thought_chunk`` update carrying one reasoning delta."""
+    return AgentThoughtChunk(
+        session_update="agent_thought_chunk",
+        content=text_block(text),
+        message_id=message_id,
+    )
+
+
 class TurnTranslator:
     """Stateful translator for one ``session/prompt`` turn.
 
@@ -104,6 +115,11 @@ class TurnTranslator:
         self._tool_inputs: dict[str, list[str]] = {}
         self._tool_outputs: dict[str, list[str]] = {}
 
+    @property
+    def total_tokens(self) -> int:
+        """Tokens consumed by the turn's model calls (in + out)."""
+        return self.input_tokens + self.output_tokens
+
     def process(self, event: Any) -> list[Any]:
         """Convert one AgentScope event into zero or more ACP updates."""
         if isinstance(event, TextBlockDeltaEvent):
@@ -111,6 +127,12 @@ class TurnTranslator:
                 return []
             message_id = f"{event.reply_id}:{event.block_id}"
             return [agent_message_chunk(message_id, event.delta)]
+
+        if isinstance(event, ThinkingBlockDeltaEvent):
+            if not event.delta:
+                return []
+            message_id = f"{event.reply_id}:{event.block_id}"
+            return [agent_thought_chunk(message_id, event.delta)]
 
         if isinstance(event, ModelCallEndEvent):
             self.input_tokens += event.input_tokens
@@ -190,7 +212,7 @@ class TurnTranslator:
                 ),
             ]
 
-        # Thinking / data-block / hint events are not surfaced in the MVP.
+        # Data-block / hint events are not surfaced.
         return []
 
     def stop_reason(self) -> str:

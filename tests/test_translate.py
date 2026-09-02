@@ -107,7 +107,6 @@ class TestTurnTranslator:
     def test_ignored_events(self):
         translator = TurnTranslator()
         ignored = [
-            ThinkingBlockDeltaEvent(reply_id="r1", block_id="t1", delta="hm"),
             ToolResultStartEvent(
                 reply_id="r1",
                 tool_call_id="c1",
@@ -116,6 +115,26 @@ class TestTurnTranslator:
         ]
         for event in ignored:
             assert translator.process(event) == []
+
+    def test_thinking_delta_streams_as_thought_chunk(self):
+        translator = TurnTranslator()
+        updates = translator.process(
+            ThinkingBlockDeltaEvent(reply_id="r1", block_id="t1", delta="hm"),
+        )
+        assert len(updates) == 1
+        update = updates[0]
+        assert update.session_update == "agent_thought_chunk"
+        assert update.message_id == "r1:t1"
+        assert update.content.text == "hm"
+
+    def test_empty_thinking_delta_is_skipped(self):
+        translator = TurnTranslator()
+        assert (
+            translator.process(
+                ThinkingBlockDeltaEvent(reply_id="r1", block_id="t1", delta=""),
+            )
+            == []
+        )
 
 
 # ----------------------------------------------------------------------

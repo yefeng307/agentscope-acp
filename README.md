@@ -29,7 +29,13 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `session/prompt` | ✅ | 驱动 `reply_stream()`，流式推送 `agent_message_chunk` |
 | `session/cancel` | ✅ | 取消当前 prompt task（stop_reason=cancelled） |
 | 工具调用流式展示 | ✅ | 内置工具集（Bash/Read/Write/Edit/Grep/Glob）→ `tool_call` / `tool_call_update`，`ACCEPT_EDITS` 自动放行 |
-| 其他（权限审批/持久化等） | 🗓 | 见下方 Roadmap |
+| 权限审批 | ✅ | `request_permission` 四选项（本次/永久放行、本次/永久拒绝）→ 永久项转 PermissionRule 回传引擎 |
+| 思考流 | ✅ | ThinkingBlockDeltaEvent → `agent_thought_chunk`（不污染正文） |
+| 会话持久化 | ✅ | AgentState → 本地 JSON；`session/load` 恢复（声明 load_session 能力） |
+| 模型切换 | ✅ | `session/set_config_option` 运行时换模型 + `config_option_update` 通知 |
+| usage 统计 | ✅ | 每轮 `usage_update`（输入+输出 token） |
+| `session/list` / `close` | ✅ | 列表（cwd 过滤）/ 关闭（保存状态 + 断开 MCP） |
+| MCP 集成 | ✅ | `session/new` 的 mcp_servers（stdio/http）→ 引擎 MCPClient |
 
 ## 环境变量
 
@@ -45,6 +51,8 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `AGENTSCOPE_ACP_TOOLS` | 否 | 开启 | 是否启用内置工具集；设 `0`/`false`/`no`/`off` 关闭（纯对话无工具） |
 | `AGENTSCOPE_ACP_TOOL_NAMES` | 否 | `Bash,Read,Write,Edit,Grep,Glob` | 工具白名单（逗号分隔类名，可选加 `PowerShell`）；引擎新增工具时改这里即可启用，无需发版 |
 | `AGENTSCOPE_ACP_SKILLS_DIR` | 否 | 关闭 | Agent Skills 目录（含 `SKILL.md` 的目录，见下方 Skill 章节），启用渐进式披露技能 |
+| `AGENTSCOPE_ACP_PERMISSION_MODE` | 否 | `ask` | `accept_edits`（编辑器操作自动放行，其余拦截）或 `ask`（逐操作审批，默认） |
+| `AGENTSCOPE_ACP_SESSIONS_DIR` | 否 | `~/.agentscope-acp/sessions` | AgentState 持久化目录（每会话一个 JSON） |
 | `AGENTSCOPE_ACP_LOG` | 否 | 关闭 | 文件日志路径（stdout 被 ACP 协议占用，绝不写 stdout） |
 
 ## Skill（Agent Skills）
@@ -107,8 +115,8 @@ agent-work 的 ACP Client 链路已完备（AcpDriver → AcpAgentTask → probe
 - Guid 首页的模型选择器数据来自 `probeAgentHandshake`（spawn 子进程 → `initialize` +
   `session/new` → 读取响应中的 `models` 字段），本项目在 `session/new` 响应中返回
   `SessionModelState`（current_model_id + available_models）即可被前端识别。
-- 会话恢复：ACP 会话状态在进程内存中（`dict[session_id, Agent]`）；前端重连时若
-  `session/load` 未实现（load_session=False），会自动回退 `session/new` 新建会话。
+- 会话恢复：本进程实现 `session/load`（声明 load_session 能力，AgentState 从本地
+  JSON 恢复）；进程重启后会话表为空（见 Roadmap 的演进方向）。
 
 ## 源码结构
 
@@ -140,15 +148,17 @@ prompt 流式推送与模型调用失败时的 in-band 错误消息（进程不�
 
 - [x] 工具调用流式展示（ToolCallStart/Delta/End → tool_call/tool_call_update；内置
       Bash/Read/Write/Edit/Grep/Glob 工具集，默认启用，`ACCEPT_EDITS` 自动放行）
-- [ ] 权限审批（RequireUserConfirmEvent → session/request_permission；
-      UserConfirmResultEvent 回传恢复；把 `ACCEPT_EDITS` 升级为前端可审批）
-- [ ] 思考流输出（ThinkingBlockDeltaEvent → agent_thought_chunk）
-- [ ] 会话持久化与恢复（AgentState 序列化到本地 JSON → session/load；声明 load_session 能力）
-- [ ] 模型切换（session/set_config_option + 动态模型查询接口 —— 调供应商 models API
-      填充 available_models，替换静态配置）
-- [ ] usage 统计（ModelCallEndEvent → usage_update）
-- [ ] session/list / session/close / session/delete
-- [ ] MCP 服务器集成（session/new 的 mcp_servers → Toolkit）
+- [x] 权限审批（RequireUserConfirmEvent → session/request_permission；
+      UserConfirmResultEvent 回传恢复；多工具逐项询问，永久选项落为引擎规则）
+- [x] 思考流输出（ThinkingBlockDeltaEvent → agent_thought_chunk）
+- [x] 会话持久化与恢复（AgentState 序列化到本地 JSON → session/load；声明 load_session 能力）
+- [x] 模型切换（session/set_config_option + config_option_update；
+      available_models 目前来自静态配置，动态查询供应商 models API 仍待做）
+- [x] usage 统计（ModelCallEndEvent → usage_update）
+- [x] session/list / session/close（session/delete 未实现——SDK 0.10 与 QwenPaw
+      均未暴露该方法，生态对齐后补）
+- [x] MCP 服务器集成（session/new 的 mcp_servers（stdio/http）→ 引擎 MCPClient；
+      sse 引擎无对应配置类型，暂跳过）
 - [ ] 结构化输出、图片等多模态 ContentBlock
 
 ### 演进方向（记录）

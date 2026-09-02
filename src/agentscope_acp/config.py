@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 from pydantic import SecretStr
 
@@ -23,12 +25,20 @@ ENV_SYSTEM_PROMPT = "AGENTSCOPE_ACP_SYSTEM_PROMPT"
 ENV_TOOLS = "AGENTSCOPE_ACP_TOOLS"
 ENV_TOOL_NAMES = "AGENTSCOPE_ACP_TOOL_NAMES"
 ENV_SKILLS_DIR = "AGENTSCOPE_ACP_SKILLS_DIR"
+ENV_PERMISSION_MODE = "AGENTSCOPE_ACP_PERMISSION_MODE"
+ENV_SESSIONS_DIR = "AGENTSCOPE_ACP_SESSIONS_DIR"
 ENV_LOG = "AGENTSCOPE_ACP_LOG"
 
 PROVIDER_DASHSCOPE = "dashscope"
 PROVIDER_OPENAI_COMPAT = "openai-compat"
 
+PERMISSION_ACCEPT_EDITS = "accept_edits"
+PERMISSION_ASK = "ask"
+PERMISSION_MODES = (PERMISSION_ACCEPT_EDITS, PERMISSION_ASK)
+
 DEFAULT_MODEL = "qwen3.6-plus"
+
+DEFAULT_SESSIONS_DIR = "~/.agentscope-acp/sessions"
 
 # The default tool set. Explicit by design: the tool set is the agent's
 # capability boundary (Bash/Write carry permission implications), and the
@@ -63,6 +73,8 @@ class AcpConfig:
     enable_tools: bool = True
     tool_names: list[str] | None = None
     skills_dir: str | None = None
+    permission_mode: str = PERMISSION_ACCEPT_EDITS
+    sessions_dir: str = DEFAULT_SESSIONS_DIR
     log_path: str | None = None
 
     @classmethod
@@ -99,6 +111,19 @@ class AcpConfig:
             or None
         )
 
+        permission_mode = os.environ.get(
+            ENV_PERMISSION_MODE,
+            PERMISSION_ACCEPT_EDITS,
+        ).strip().lower()
+        if permission_mode not in PERMISSION_MODES:
+            logger.warning(
+                "unknown %s %r — falling back to %r",
+                ENV_PERMISSION_MODE,
+                permission_mode,
+                PERMISSION_ACCEPT_EDITS,
+            )
+            permission_mode = PERMISSION_ACCEPT_EDITS
+
         return cls(
             provider=provider,
             api_key=api_key,
@@ -109,8 +134,20 @@ class AcpConfig:
             enable_tools=_parse_bool(os.environ.get(ENV_TOOLS, ""), True),
             tool_names=tool_names,
             skills_dir=os.environ.get(ENV_SKILLS_DIR, "").strip() or None,
+            permission_mode=permission_mode,
+            sessions_dir=os.environ.get(ENV_SESSIONS_DIR, "").strip()
+            or DEFAULT_SESSIONS_DIR,
             log_path=os.environ.get(ENV_LOG, "").strip() or None,
         )
+
+
+def sessions_path(config: AcpConfig) -> Path:
+    """Resolve the session persistence directory from ``config``."""
+    return Path(
+        config.sessions_dir,
+    ).expanduser() if config.sessions_dir else Path(
+        DEFAULT_SESSIONS_DIR,
+    ).expanduser()
 
 
 def _parse_bool(raw: str, default: bool) -> bool:
@@ -133,6 +170,7 @@ def build_toolkit(
     enable_tools: bool,
     skills_dir: str | None = None,
     tool_names: list[str] | None = None,
+    mcps: list[Any] | None = None,
 ):
     """Build the built-in coding tool set, or ``None`` for a tool-less agent.
 
@@ -147,6 +185,10 @@ def build_toolkit(
     ``Toolkit.skills_or_loaders``; see README for the directory layout. A
     missing directory is ignored with a warning so a stale env value never
     breaks startup.
+
+    ``mcps`` registers already-connected :class:`~agentscope.mcp.MCPClient`
+    instances (built by :func:`build_mcp_clients` from the ACP
+    ``session/new`` ``mcp_servers`` payload).
 
     Imports are deferred so a tool-less configuration (and the unit tests
     that avoid AgentScope's tool stack) never pay the import cost.
@@ -209,15 +251,108 @@ def build_toolkit(
     return Toolkit(
         tools=tools,
         skills_or_loaders=skills_or_loaders,
+        mcps=mcps or [],
     )
 
 
-def configure_permissions(agent, cwd: str | None) -> None:
-    """Auto-approve file operations inside the working directory.
+def build_mcp_clients(mcp_servers: list[Any] | None) -> list[Any]:
+    """Convert ACP ``mcp_servers`` entries into AgentScope ``MCPClient``s.
 
-    Tool support "path B" (todo 1.1): run with ``ACCEPT_EDITS`` so the
-    agent can read/write inside ``cwd`` without a frontend approval
-    round-trip. Interactive ``session/request_permission`` is todo 1.2.
+    Pure configuration conversion — no IO. Connection is performed by
+    :func:`connect_mcp_clients`. ``stdio`` and ``http`` transports are
+    supported; ``sse``/``acp`` servers are unsupported by the AgentScope
+    engine and skipped with a warning.
+    """
+    if not mcp_servers:
+        return []
+
+    from agentscope.mcp import HttpMCPConfig, MCPClient, StdioMCPConfig
+
+    clients: list[Any] = []
+    for server in mcp_servers:
+        # McpServerStdio carries no discriminator ``type`` field (unlike
+        # the Http/Sse/Acp variants), so default to stdio.
+        server_type = getattr(server, "type", None) or "stdio"
+        name = getattr(server, "name", None) or server_type or "mcp"
+        try:
+            if server_type == "stdio":
+                env_list = getattr(server, "env", None) or []
+                client = MCPClient(
+                    name=name,
+                    is_stateful=True,
+                    mcp_config=StdioMCPConfig(
+                        command=getattr(server, "command", ""),
+                        args=getattr(server, "args", None) or None,
+                        env={
+                            item.name: item.value for item in env_list
+                        } or None,
+                    ),
+                )
+            elif server_type == "http":
+                headers = getattr(server, "headers", None) or []
+                client = MCPClient(
+                    name=name,
+                    is_stateful=False,
+                    mcp_config=HttpMCPConfig(
+                        url=getattr(server, "url", ""),
+                        headers={
+                            item.name: item.value for item in headers
+                        } or None,
+                    ),
+                )
+            else:
+                logger.warning(
+                    "unsupported MCP server type %r (%s) — skipping",
+                    server_type,
+                    name,
+                )
+                continue
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "invalid MCP server config for %r: %s — skipping",
+                name,
+                exc,
+            )
+            continue
+        clients.append(client)
+    return clients
+
+
+async def connect_mcp_clients(clients: list[Any]) -> list[Any]:
+    """Connect stateful MCP clients, dropping the ones that fail.
+
+    Stateless (HTTP) clients need no explicit connection.
+    """
+    connected: list[Any] = []
+    for client in clients:
+        if not client.is_stateful:
+            connected.append(client)
+            continue
+        try:
+            await client.connect()
+        except Exception as exc:  # pragma: no cover - IO dependent
+            logger.warning(
+                "failed to connect MCP %r: %s — skipping",
+                client.name,
+                exc,
+            )
+            continue
+        connected.append(client)
+    return connected
+
+
+def configure_permissions(
+    agent,
+    cwd: str | None,
+    permission_mode: str = PERMISSION_ACCEPT_EDITS,
+) -> None:
+    """Configure the agent's permission context.
+
+    ``accept_edits`` (default): auto-approve file operations inside ``cwd``
+    without a frontend round-trip.
+
+    ``ask``: keep the engine default (``ASK``) so every tool call surfaces
+    a ``session/request_permission`` popup in the client.
     """
     from agentscope.permission import (
         AdditionalWorkingDirectory,
@@ -225,7 +360,11 @@ def configure_permissions(agent, cwd: str | None) -> None:
     )
 
     context = agent.state.permission_context
-    context.mode = PermissionMode.ACCEPT_EDITS
+    if permission_mode == PERMISSION_ACCEPT_EDITS:
+        context.mode = PermissionMode.ACCEPT_EDITS
+    else:
+        # DEFAULT = explicit permission per action (ASK behavior).
+        context.mode = PermissionMode.DEFAULT
     if cwd:
         context.working_directories[cwd] = AdditionalWorkingDirectory(
             path=cwd,
@@ -233,13 +372,18 @@ def configure_permissions(agent, cwd: str | None) -> None:
         )
 
 
-def build_chat_model(config: AcpConfig):
+def build_chat_model(config: AcpConfig, model: str | None = None):
     """Instantiate the AgentScope chat model described by ``config``.
+
+    ``model`` overrides ``config.model`` — used by ``set_config_option``
+    for runtime model switching.
 
     Credentials are read at call time (not import time) so tests can patch
     the environment. Raises ``ValueError`` with an actionable message when
     the API key is missing — surfaced by the ACP agent as a protocol error.
     """
+    model_name = model or config.model
+
     if not config.api_key:
         env_name = api_key_env_name(config.provider)
         raise ValueError(
@@ -261,7 +405,7 @@ def build_chat_model(config: AcpConfig):
             credential=DashScopeCredential(
                 api_key=SecretStr(key),
             ),
-            model=config.model,
+            model=model_name,
         )
 
     from agentscope.credential import OpenAICredential
@@ -273,5 +417,5 @@ def build_chat_model(config: AcpConfig):
             api_key=SecretStr(key),
             base_url=base_url,
         ),
-        model=config.model,
+        model=model_name,
     )

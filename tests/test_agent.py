@@ -7,14 +7,16 @@ fake yielding a scripted event stream, so no model/network is involved.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
 from acp.exceptions import RequestError
-from acp.schema import TextContentBlock
+from acp.schema import AllowedOutcome, TextContentBlock
 from agentscope.event import (
     ModelCallEndEvent,
     ReplyEndEvent,
+    RequireUserConfirmEvent,
     TextBlockDeltaEvent,
     ToolCallDeltaEvent,
     ToolCallEndEvent,
@@ -22,8 +24,11 @@ from agentscope.event import (
     ToolResultEndEvent,
     ToolResultStartEvent,
     ToolResultTextDeltaEvent,
+    UserConfirmResultEvent,
 )
 from agentscope.event._event import ToolResultState
+from agentscope.message import ToolCallBlock
+from agentscope.state import AgentState
 from agentscope.types import ReplyFinishedReason
 from pydantic import SecretStr
 
@@ -38,27 +43,55 @@ from agentscope_acp.config import AcpConfig, ModelEntry, build_toolkit
 class RecordingConn:
     """Fake ``acp.interfaces.Client`` recording session_update calls."""
 
-    def __init__(self) -> None:
+    def __init__(self, permission_outcomes: list[Any] | None = None) -> None:
         self.updates: list[tuple[str, Any]] = []
+        self.permission_requests: list[tuple[str, Any, list[Any]]] = []
+        self._outcomes = list(permission_outcomes or [])
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         self.updates.append((session_id, update))
 
+    async def request_permission(
+        self,
+        session_id: str,
+        tool_call: Any,
+        options: list[Any],
+        **kwargs: Any,
+    ) -> Any:
+        self.permission_requests.append((session_id, tool_call, options))
+        if self._outcomes:
+            return self._outcomes.pop(0)
+        return AllowedOutcome(outcome="selected", option_id="allow_once")
+
 
 class FakeAgentScopeAgent:
-    """Fake AgentScope Agent with a scripted reply_stream."""
+    """Fake AgentScope Agent with a scripted, cursor-advancing reply_stream.
+
+    Mirroring the engine, a ``RequireUserConfirmEvent`` ends the generator;
+    the next ``reply_stream`` call resumes right after it (the resume event
+    passed in ``inputs``).
+    """
 
     def __init__(self, events: list[Any] | None = None, error: Exception | None = None):
         self.events = events or []
         self.error = error
         self.received: list[Any] = []
+        self.state = AgentState()
+        self.model: Any = None
+        self._pos = 0
+        self._error_raised = False
 
     async def reply_stream(self, inputs: Any = None, **kwargs: Any):
         self.received.append(inputs)
-        for event in self.events:
+        while self._pos < len(self.events):
+            event = self.events[self._pos]
+            self._pos += 1
             await asyncio.sleep(0)
             yield event
-        if self.error is not None:
+            if isinstance(event, RequireUserConfirmEvent):
+                return
+        if self.error is not None and not self._error_raised:
+            self._error_raised = True
             raise self.error
 
 
@@ -100,12 +133,15 @@ def _stream_events() -> list[Any]:
     ]
 
 
-def _make_agent(fake: Any) -> AgentScopeAcpAgent:
+def _make_agent(
+    fake: Any,
+    permission_outcomes: list[Any] | None = None,
+) -> AgentScopeAcpAgent:
     acp_agent = AgentScopeAcpAgent(
         _config(),
-        agent_factory=lambda cfg, cwd: fake,
+        agent_factory=lambda cfg, cwd, mcp_clients=None, state=None: fake,
     )
-    acp_agent.on_connect(RecordingConn())
+    acp_agent.on_connect(RecordingConn(permission_outcomes))
     return acp_agent
 
 
@@ -117,10 +153,10 @@ async def test_initialize_declares_baseline_capabilities():
     acp_agent = _make_agent(FakeAgentScopeAgent())
     response = await acp_agent.initialize(protocol_version=1)
     assert response.agent_info.name == "agentscope-acp"
-    assert response.agent_capabilities.load_session is False
+    assert response.agent_capabilities.load_session is True
 
 
-async def test_new_session_advertises_models():
+async def test_new_session_advertises_models_and_config_options():
     acp_agent = _make_agent(FakeAgentScopeAgent())
     response = await acp_agent.new_session(cwd="/tmp")
     models = response.models
@@ -129,12 +165,25 @@ async def test_new_session_advertises_models():
         "qwen3.6-plus",
         "qwen3.6-max",
     ]
+    # Model picker advertised as a runtime config option.
+    assert len(response.config_options) == 1
+    option = response.config_options[0]
+    assert option.id == "model" and option.current_value == "qwen3.6-plus"
+    assert [o.value for o in option.options] == [
+        "qwen3.6-plus",
+        "qwen3.6-max",
+    ]
     # Session registered for subsequent prompts.
-    assert response.session_id in acp_agent._sessions
+    assert response.session_id in acp_agent._records
 
 
 async def test_new_session_invalid_config_raises_request_error():
-    def failing_factory(cfg: AcpConfig, cwd: str):
+    def failing_factory(
+        cfg: AcpConfig,
+        cwd: str,
+        mcp_clients=None,
+        state=None,
+    ):
         raise ValueError("Missing DASHSCOPE_API_KEY")
 
     acp_agent = AgentScopeAcpAgent(_config(), agent_factory=failing_factory)
@@ -158,11 +207,20 @@ async def test_prompt_streams_chunks_and_ends_turn():
 
     assert response.stop_reason == "end_turn"
     conn = acp_agent._conn
-    assert len(conn.updates) == 2
-    ids = {u.message_id for _, u in conn.updates}
+    # 2 text chunks + 1 usage update at the end of the turn.
+    assert len(conn.updates) == 3
+    ids = {u.message_id for _, u in conn.updates if u.session_update == "agent_message_chunk"}
     assert ids == {"r1:b1"}
-    texts = "".join(u.content.text for _, u in conn.updates)
+    texts = "".join(
+        u.content.text
+        for _, u in conn.updates
+        if u.session_update == "agent_message_chunk"
+    )
     assert texts == "Hello"
+    # Usage was reported from the ModelCallEndEvent.
+    usage = conn.updates[-1][1]
+    assert usage.session_update == "usage_update"
+    assert usage.used == 15
     # The user message reached the AgentScope agent.
     assert len(fake.received) == 1
 
@@ -197,6 +255,17 @@ async def test_prompt_error_is_reported_in_band():
     conn = acp_agent._conn
     assert len(conn.updates) == 1
     assert "boom" in conn.updates[0][1].content.text
+
+
+async def test_prompt_without_model_calls_skips_usage():
+    fake = FakeAgentScopeAgent(
+        [ReplyEndEvent(session_id="s", reply_id="r1")],
+    )
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(prompt=_prompt_blocks("hi"), session_id=session.session_id)
+    assert acp_agent._conn.updates == []
 
 
 # ----------------------------------------------------------------------
@@ -345,3 +414,294 @@ async def test_build_toolkit_default_set():
     toolkit = build_toolkit(True)
     names = [t.name for t in toolkit.tool_groups[0].tools]
     assert names == ["Bash", "Read", "Write", "Edit", "Grep", "Glob"]
+
+
+# ----------------------------------------------------------------------
+# interactive permission approval
+# ----------------------------------------------------------------------
+
+def _permission_events() -> list[Any]:
+    return [
+        TextBlockDeltaEvent(reply_id="r1", block_id="b1", delta="pre"),
+        RequireUserConfirmEvent(
+            reply_id="r1",
+            tool_calls=[
+                ToolCallBlock(id="c1", name="Bash", input='{"cmd": "rm x"}'),
+            ],
+        ),
+        TextBlockDeltaEvent(reply_id="r1", block_id="b2", delta="post"),
+        ReplyEndEvent(session_id="s", reply_id="r1"),
+    ]
+
+
+async def test_prompt_requests_permission_and_resumes_on_allow():
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[
+            AllowedOutcome(outcome="selected", option_id="allow_once"),
+        ],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    conn = acp_agent._conn
+    # The client was asked before the tool ran.
+    assert len(conn.permission_requests) == 1
+    _, tool_call_update, options = conn.permission_requests[0]
+    assert tool_call_update.tool_call_id == "c1"
+    assert tool_call_update.title == "Bash"
+    assert tool_call_update.kind == "execute"
+    assert [o.kind for o in options] == [
+        "allow_once",
+        "allow_always",
+        "reject_once",
+        "reject_always",
+    ]
+    # The engine was resumed with a confirmed result and kept streaming.
+    assert len(fake.received) == 2
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is True
+    assert resume.confirm_results[0].rules is None
+    texts = [
+        u.content.text
+        for _, u in conn.updates
+        if u.session_update == "agent_message_chunk"
+    ]
+    assert texts == ["pre", "post"]
+
+
+async def test_prompt_denied_permission_resumes_with_rejection():
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[
+            AllowedOutcome(outcome="selected", option_id="reject_once"),
+        ],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is False
+
+
+async def test_prompt_allow_always_adds_permission_rule():
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[
+            AllowedOutcome(outcome="selected", option_id="allow_always"),
+        ],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    rule = resume.confirm_results[0].rules[0]
+    assert rule.tool_name == "Bash"
+    assert rule.behavior.value == "allow"
+
+
+async def test_prompt_cancelled_permission_is_rejection():
+    from acp.schema import DeniedOutcome
+
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[DeniedOutcome(outcome="cancelled")],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    assert resume.confirm_results[0].confirmed is False
+
+
+# ----------------------------------------------------------------------
+# runtime model switching
+# ----------------------------------------------------------------------
+
+async def test_set_config_option_switches_model():
+    fake = FakeAgentScopeAgent(_stream_events())
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.set_config_option(
+        config_id="model",
+        session_id=session.session_id,
+        value="qwen3.6-max",
+    )
+
+    assert response.config_options[0].current_value == "qwen3.6-max"
+    # The live agent now uses the new model.
+    assert fake.model.model == "qwen3.6-max"
+    # The client was notified of the change.
+    updates = [
+        u for _, u in acp_agent._conn.updates
+        if u.session_update == "config_option_update"
+    ]
+    assert len(updates) == 1
+    assert updates[0].config_options[0].current_value == "qwen3.6-max"
+
+
+async def test_set_config_option_unknown_id_raises():
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    session = await acp_agent.new_session(cwd="/tmp")
+    with pytest.raises(RequestError):
+        await acp_agent.set_config_option(
+            config_id="nope",
+            session_id=session.session_id,
+            value="x",
+        )
+
+
+# ----------------------------------------------------------------------
+# session persistence / lifecycle
+# ----------------------------------------------------------------------
+
+async def test_prompt_persists_state_to_disk(tmp_path):
+    fake = FakeAgentScopeAgent(_stream_events())
+    config = _config()
+    config.sessions_dir = str(tmp_path)
+    acp_agent = AgentScopeAcpAgent(
+        config,
+        agent_factory=lambda cfg, cwd, mcp_clients=None, state=None: fake,
+    )
+    acp_agent.on_connect(RecordingConn())
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(prompt=_prompt_blocks("hi"), session_id=session.session_id)
+
+    saved = tmp_path / f"{session.session_id}.json"
+    assert saved.exists()
+    raw = json.loads(saved.read_text(encoding="utf-8"))
+    assert raw["session_id"] == session.session_id
+
+
+async def test_load_session_restores_state(tmp_path):
+    config = _config()
+    config.sessions_dir = str(tmp_path)
+    state = AgentState()
+    saved = tmp_path / "saved1.json"
+    saved.write_text(state.model_dump_json(), encoding="utf-8")
+
+    fake = FakeAgentScopeAgent()
+    captured: dict[str, Any] = {}
+
+    def factory(cfg, cwd, mcp_clients=None, state=None):
+        captured["state"] = state
+        return fake
+
+    acp_agent = AgentScopeAcpAgent(config, agent_factory=factory)
+    acp_agent.on_connect(RecordingConn())
+
+    response = await acp_agent.load_session(cwd="/tmp", session_id="saved1")
+
+    assert "saved1" in acp_agent._records
+    assert response.config_options[0].current_value == "qwen3.6-plus"
+    # The factory received the restored state.
+    assert isinstance(captured["state"], AgentState)
+
+
+async def test_load_session_missing_raises(tmp_path):
+    config = _config()
+    config.sessions_dir = str(tmp_path)
+    acp_agent = AgentScopeAcpAgent(
+        config,
+        agent_factory=lambda cfg, cwd, mcp_clients=None, state=None: None,
+    )
+    acp_agent.on_connect(RecordingConn())
+    with pytest.raises(RequestError):
+        await acp_agent.load_session(cwd="/tmp", session_id="ghost")
+
+
+async def test_list_sessions_reports_open_sessions():
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    await acp_agent.new_session(cwd="/tmp")
+    response = await acp_agent.list_sessions()
+
+    assert len(response.sessions) == 1
+    info = response.sessions[0]
+    assert info.cwd == "/tmp"
+    assert info.updated_at is not None
+
+
+async def test_close_session_removes_record():
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.close_session(session_id=session.session_id)
+    assert acp_agent._records == {}
+
+
+# ----------------------------------------------------------------------
+# MCP server conversion
+# ----------------------------------------------------------------------
+
+async def test_build_mcp_clients_stdio_and_http():
+    from acp.schema import EnvVariable, HttpMcpServer, McpServerStdio
+    from agentscope_acp.config import build_mcp_clients
+
+    clients = build_mcp_clients(
+        [
+            McpServerStdio(
+                name="fs",
+                command="mcp-fs",
+                args=["--root", "/data"],
+                env=[EnvVariable(name="K", value="V")],
+            ),
+            HttpMcpServer(
+                type="http",
+                name="web",
+                url="https://example.com/mcp",
+                headers=[],
+            ),
+        ],
+    )
+
+    assert len(clients) == 2
+    stdio, http = clients
+    assert stdio.name == "fs" and stdio.is_stateful is True
+    assert stdio.mcp_config.type == "stdio_mcp"
+    assert stdio.mcp_config.args == ["--root", "/data"]
+    assert stdio.mcp_config.env == {"K": "V"}
+    assert http.name == "web" and http.is_stateful is False
+    assert http.mcp_config.type == "http_mcp"
+    assert http.mcp_config.url == "https://example.com/mcp"
+
+
+async def test_build_mcp_clients_skips_unsupported_types():
+    from acp.schema import SseMcpServer
+    from agentscope_acp.config import build_mcp_clients
+
+    clients = build_mcp_clients(
+        [
+            SseMcpServer(
+                type="sse",
+                name="sse",
+                url="https://example.com/sse",
+                headers=[],
+            ),
+        ],
+    )
+    assert clients == []
