@@ -159,6 +159,10 @@ def _uri_to_path(uri: str) -> str:
         elif len(path) >= 3 and path[0] == "/" and path[2] == ":":
             # file:///D:/x — drop the leading slash.
             path = path[1:]
+        # Zed's fs/read_text_file resolves backslash paths only: file://
+        # URIs and forward-slash paths come back as -32002 "Resource not
+        # found" (verified against a live Zed capture).
+        path = path.replace("/", "\\")
     return path
 
 

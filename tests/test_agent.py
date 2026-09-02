@@ -622,8 +622,11 @@ async def test_prompt_permission_nested_response_shape():
 
 def test_uri_to_path_converts_file_uris():
     if os.name == "nt":
-        assert _uri_to_path("file:///D:/proj/x.txt") == "D:/proj/x.txt"
-        assert _uri_to_path("file://D:/proj/x.txt") == "D:/proj/x.txt"
+        # Zed's fs/read_text_file only accepts backslash paths (verified
+        # against a live capture: file:// URIs and forward slashes return
+        # -32002 Resource not found).
+        assert _uri_to_path("file:///D:/proj/x.txt") == "D:\\proj\\x.txt"
+        assert _uri_to_path("file://D:/proj/x.txt") == "D:\\proj\\x.txt"
     else:
         assert _uri_to_path("file:///home/u/x.txt") == "/home/u/x.txt"
     # Non-file URIs pass through unchanged.
@@ -666,7 +669,7 @@ async def test_prompt_resolves_resource_link_and_embedded_resource():
     assert len(conn.read_requests) == 1
     request_session, path = conn.read_requests[0]
     assert request_session == session.session_id
-    assert path.endswith("D:/proj/x.txt")
+    assert path.replace("\\", "/").endswith("D:/proj/x.txt")
     user_text = _received_text(fake.received[0])
     assert "look at this" in user_text
     assert "file body" in user_text
