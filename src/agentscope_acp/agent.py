@@ -375,9 +375,11 @@ class AgentScopeAcpAgent(Agent):
                     )
                     continue
                 try:
+                    # Keyword args: published acp SDK versions disagree on
+                    # the positional order of (session_id, path).
                     response = await self._conn.read_text_file(
-                        session_id,
-                        _uri_to_path(uri),
+                        session_id=session_id,
+                        path=_uri_to_path(uri),
                     )
                     content = getattr(response, "content", None)
                 except Exception:
