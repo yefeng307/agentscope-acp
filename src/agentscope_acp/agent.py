@@ -39,10 +39,15 @@ from acp.schema import (
     ListSessionsResponse,
     ModelInfo,
     PermissionOption,
+    ResumeSessionResponse,
+    SessionCapabilities,
+    SessionCloseCapabilities,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionInfo,
+    SessionListCapabilities,
     SessionModelState,
+    SessionResumeCapabilities,
     SetSessionConfigOptionResponse,
     ToolCallUpdate,
     UsageUpdate,
@@ -232,7 +237,14 @@ class AgentScopeAcpAgent(Agent):
         )
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_capabilities=AgentCapabilities(load_session=True),
+            agent_capabilities=AgentCapabilities(
+                load_session=True,
+                session_capabilities=SessionCapabilities(
+                    close=SessionCloseCapabilities(),
+                    list=SessionListCapabilities(),
+                    resume=SessionResumeCapabilities(),
+                ),
+            ),
             agent_info=Implementation(
                 name=AGENT_NAME,
                 title=AGENT_TITLE,
@@ -330,6 +342,78 @@ class AgentScopeAcpAgent(Agent):
         )
         logger.info("load_session: id=%s cwd=%s", session_id, cwd)
         return LoadSessionResponse(
+            config_options=self._build_config_options(self._config.model),
+        )
+
+    async def resume_session(  # pylint: disable=unused-argument
+        self,
+        cwd: str,
+        session_id: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[Any] | None = None,
+        **kwargs: Any,
+    ) -> ResumeSessionResponse:
+        """Re-attach a known session, reusing its state when possible.
+
+        Priority: in-memory record (reused as-is, cwd refreshed) ->
+        persisted state on disk (restored like ``session/load``) -> fresh
+        state (like ``session/new`` under the client's id). The fallback
+        chain means a client reconnect can never fail on a missing id —
+        mirrors QwenPaw's resume-or-recreate semantics.
+        """
+        record = self._records.get(session_id)
+        if record is not None:
+            record.cwd = cwd
+            logger.info(
+                "resume_session: id=%s cwd=%s (in-memory)",
+                session_id,
+                cwd,
+            )
+            return ResumeSessionResponse(
+                config_options=self._build_config_options(
+                    record.model_id or self._config.model,
+                ),
+            )
+
+        path = sessions_path(self._config) / f"{session_id}.json"
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            state = AgentState.model_validate(raw)
+        except FileNotFoundError:
+            state = None
+        except Exception as exc:
+            raise RequestError.invalid_params(
+                {"details": f"Corrupt session state: {exc}"},
+            ) from None
+
+        clients = await connect_mcp_clients(build_mcp_clients(mcp_servers))
+        try:
+            agent = self._agent_factory(
+                self._config,
+                cwd,
+                mcp_clients=clients,
+                state=state,
+            )
+        except ValueError as exc:
+            raise RequestError.invalid_params({"details": str(exc)}) from None
+        record = SessionRecord(
+            agent=agent,
+            cwd=cwd,
+            mcp_clients=clients,
+            updated_at=_now_iso(),
+            model_id=self._config.model,
+        )
+        self._records[session_id] = record
+        # Persist immediately so a later session/load (after a process
+        # restart) finds the resurrected session.
+        self._save_state(record, session_id)
+        logger.info(
+            "resume_session: id=%s cwd=%s restored=%s",
+            session_id,
+            cwd,
+            state is not None,
+        )
+        return ResumeSessionResponse(
             config_options=self._build_config_options(self._config.model),
         )
 
@@ -552,6 +636,25 @@ class AgentScopeAcpAgent(Agent):
         **kwargs: Any,
     ) -> None:
         logger.info("close_session: session=%s", session_id)
+        # Abort any in-flight prompt so closing mid-turn stops the model
+        # instead of burning tokens until the reply finishes.
+        prompt_task = self._prompt_tasks.get(session_id)
+        if (
+            prompt_task is not None
+            and prompt_task is not asyncio.current_task()
+            and not prompt_task.done()
+        ):
+            prompt_task.cancel()
+            try:
+                await prompt_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # The prompt handler already reported the error in-band.
+                logger.exception(
+                    "prompt task failed while closing: session=%s",
+                    session_id,
+                )
         record = self._records.pop(session_id, None)
         if record is None:
             return

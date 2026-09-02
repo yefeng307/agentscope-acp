@@ -206,6 +206,11 @@ async def test_initialize_declares_baseline_capabilities():
     response = await acp_agent.initialize(protocol_version=1)
     assert response.agent_info.name == "agentscope-acp"
     assert response.agent_capabilities.load_session is True
+    caps = response.agent_capabilities.session_capabilities
+    assert caps is not None
+    assert caps.close is not None
+    assert caps.list is not None
+    assert caps.resume is not None
 
 
 async def test_new_session_advertises_models_and_config_options():
@@ -348,6 +353,27 @@ async def test_cancel_aborts_prompt_with_cancelled_stop_reason():
 async def test_cancel_without_active_prompt_is_noop():
     acp_agent = _make_agent(FakeAgentScopeAgent())
     await acp_agent.cancel(session_id="whatever")
+
+
+async def test_close_session_cancels_inflight_prompt():
+    acp_agent = _make_agent(ForeverAgent())
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    prompt_task = asyncio.create_task(
+        acp_agent.prompt(
+            prompt=_prompt_blocks("slow question"),
+            session_id=session.session_id,
+        ),
+    )
+    # Give the prompt task a chance to register itself.
+    await asyncio.sleep(0.05)
+
+    await acp_agent.close_session(session_id=session.session_id)
+    response = await prompt_task
+
+    assert response.stop_reason == "cancelled"
+    assert acp_agent._records == {}
+    assert session.session_id not in acp_agent._prompt_tasks
 
 
 # ----------------------------------------------------------------------
@@ -892,6 +918,58 @@ async def test_close_session_removes_record():
 
     await acp_agent.close_session(session_id=session.session_id)
     assert acp_agent._records == {}
+
+
+async def test_resume_session_reuses_inmemory_record():
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+    session = await acp_agent.new_session(cwd="/tmp")
+    original = acp_agent._records[session.session_id]
+
+    response = await acp_agent.resume_session(
+        cwd="/elsewhere",
+        session_id=session.session_id,
+    )
+
+    assert acp_agent._records[session.session_id] is original
+    assert original.cwd == "/elsewhere"
+    assert response.config_options[0].current_value == "qwen3.6-plus"
+
+
+async def test_resume_session_restores_from_disk(tmp_path):
+    config = _config()
+    config.sessions_dir = str(tmp_path)
+    state = AgentState()
+    saved = tmp_path / "resume1.json"
+    saved.write_text(state.model_dump_json(), encoding="utf-8")
+
+    fake = FakeAgentScopeAgent()
+    captured: dict[str, Any] = {}
+
+    def factory(cfg, cwd, mcp_clients=None, state=None):
+        captured["state"] = state
+        return fake
+
+    acp_agent = AgentScopeAcpAgent(config, agent_factory=factory)
+    acp_agent.on_connect(RecordingConn())
+
+    response = await acp_agent.resume_session(cwd="/tmp", session_id="resume1")
+
+    assert "resume1" in acp_agent._records
+    assert response.config_options[0].current_value == "qwen3.6-plus"
+    assert isinstance(captured["state"], AgentState)
+
+
+async def test_resume_session_creates_fresh_when_unknown(tmp_path):
+    """An unknown id degrades to a fresh session under the client's id,
+    persisted immediately like session/new."""
+    acp_agent = _make_agent(FakeAgentScopeAgent())
+
+    response = await acp_agent.resume_session(cwd="/tmp", session_id="brandnew")
+
+    assert "brandnew" in acp_agent._records
+    assert response.config_options[0].current_value == "qwen3.6-plus"
+    saved = tmp_path / "brandnew.json"
+    assert saved.exists()
 
 
 # ----------------------------------------------------------------------
