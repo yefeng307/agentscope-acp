@@ -24,7 +24,7 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 
 | ACP 方法 | 状态 | 说明 |
 |---------|:---:|------|
-| `initialize` | ✅ | 握手，声明 load_session 能力 |
+| `initialize` | ✅ | 握手，声明 load_session / close / list / resume 能力 |
 | `session/new` | ✅ | 创建 AgentScope Agent 会话，附带 models 状态（前端模型选择器数据源） |
 | `session/prompt` | ✅ | 驱动 `reply_stream()`，流式推送 `agent_message_chunk` |
 | `session/cancel` | ✅ | 取消当前 prompt task（stop_reason=cancelled） |
@@ -35,7 +35,9 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | @文件引用 | ✅ | `resource_link` 块经 `fs/read_text_file` 拉取内容（按客户端 fs 能力门控）；`resource` 内嵌块直接纳入正文；解析失败跳过不阻断 |
 | 模型切换 | ✅ | `session/set_config_option` 运行时换模型（响应回传新配置） |
 | usage 统计 | ✅ | 每轮 `usage_update`（输入+输出 token） |
-| `session/list` / `close` | ✅ | 列表（cwd 过滤）/ 关闭（保存状态 + 断开 MCP） |
+| `session/list` | ✅ | 列表（cwd 过滤） |
+| `session/close` | ✅ | 取消进行中 prompt + 删除磁盘状态 + 断开 MCP |
+| `session/resume` | ✅ | 重新挂接已存在会话（内存 → 磁盘 → 新建降级链） |
 | MCP 集成 | ✅ | `session/new` 的 mcp_servers（stdio/http）→ 引擎 MCPClient |
 
 
@@ -95,12 +97,16 @@ EOF
 
 ## agent-work 接入
 
-agent-work 的 ACP Client 链路已完备（AcpDriver → AcpAgentTask → probe 预取模型），
-安装本包后添加一个自定义 Agent（设置页「自定义 Agent」或 agent_catalog 种子）：
+agent-work 的 ACP Client 链路已完备（AcpDriver → AcpAgentTask → probe 预取模型）。
+集成侧拿到本仓库源码后，先把可执行文件装出来，再在 agent 配置里加一条记录：
 
 ```bash
-uv tool install agentscope-acp
+cd agentscope-acp
+uv sync                # 开发调试：uv run agentscope-acp
+uv tool install .      # 安装为可执行文件（~/.local/bin/agentscope-acp）
 ```
+
+agent-work 侧在 seed.ts 的 agent_catalog（或设置页「自定义 Agent」）中添加：
 
 ```json
 {
@@ -116,50 +122,18 @@ uv tool install agentscope-acp
 }
 ```
 
-说明：
-- 启动方式与 pi-agent 一致（seed.ts 里 `command: "pi-acp"`）：agent-work 用
-  `spawn(command, args, { env })` 拉起子进程，command 通过服务器进程的 PATH 解析。
-  若 agent-work 以服务方式运行，需保证安装目录（uv tool 默认 `~/.local/bin`）在其
-  PATH 中，或 command 写安装后的绝对路径。
-- Skill：agent-work 会把前端启用的 skills 软链进 `nativeSkillsDirs`（与 pi-agent 的
-  `~/.pi/agent/skills/` 同机制），本进程通过 `AGENTSCOPE_ACP_SKILLS_DIR` 读同一目录
-  的 `SKILL.md`——两者必须指向同一路径。
-- Guid 首页的模型选择器数据来自 `probeAgentHandshake`（spawn 子进程 → `initialize` +
-  `session/new` → 读取响应中的 `models` 字段），本项目在 `session/new` 响应中返回
-  `SessionModelState`（current_model_id + available_models）即可被前端识别。
-- 会话恢复：本进程实现 `session/load`（声明 load_session 能力，AgentState 从本地
-  JSON 恢复）；进程重启后内存会话表清空，已落盘的状态仍可通过 `session/load` 恢复。
+与 pi-agent（seed.ts 里 `command: "pi-acp"`）同模式，需要注意：
 
-## 离线交付（wheel 包）
-
-本体是纯 Python wheel（`py3-none-any`，跨平台跨 Python 版本），但依赖树里含二进制
-扩展（pydantic-core、numpy、aiohttp 等，带 `cpXX`/平台标签），交付包必须按**目标
-Python 版本 + 平台**生成：
-
-```bash
-# 1. 打本体 wheel（生成 dist/agentscope_acp-0.1.0-py3-none-any.whl）
-uv build
-
-# 2. 按目标环境下载全部依赖（示例：Python 3.13 + Windows x64）
-uv pip download --python-version 3.13 --platform win_amd64 \
-    --python-platform windows \
-    dist/agentscope_acp-0.1.0-py3-none-any.whl -d dist/deps
-
-# 3. 本体与依赖放进同一目录，整体交付 dist/deps
-cp dist/agentscope_acp-0.1.0-py3-none-any.whl dist/deps/
-```
-
-目标机离线安装（无需网络）：
-
-```bash
-uv tool install --no-index --find-links dist/deps agentscope-acp
-# 或
-pip install --no-index --find-links dist/deps agentscope_acp-0.1.0-py3-none-any.whl
-```
-
-Linux 目标把 `--platform win_amd64 --python-platform windows` 换成
-`--platform manylinux_2_17_x86_64 --python-platform linux`（或对应平台标签）；
-Python 版本不同则改 `--python-version`。
+- 启动：agent-work 以 `spawn(command, args, { env })` 拉起子进程，`command`
+  经服务器进程的 PATH 解析。服务方式运行时需保证 uv tool 安装目录
+  （默认 `~/.local/bin`）在 PATH 中，或 `command` 写安装后的绝对路径。
+- Skill：前端启用的 skills 软链进 `nativeSkillsDirs`（与 pi-agent 同机制），
+  必须与 `AGENTSCOPE_ACP_SKILLS_DIR` 指向同一目录。
+- 模型选择器：Guid 首页数据来自 `probeAgentHandshake`（`initialize` +
+  `session/new` → 读取响应 `models` 字段）；本项目在 `session/new` 响应中返回
+  `SessionModelState`（current_model_id + available_models），前端开箱可用。
+- 会话恢复：进程重启后内存会话表清空，已落盘状态仍可通过 `session/load`
+  恢复（AgentState 从本地 JSON 恢复）。
 
 ## 源码结构
 
