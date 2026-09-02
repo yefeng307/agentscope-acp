@@ -26,7 +26,8 @@ wheels = [
 
 [[package]]
 name = "agentscope"
-source = { editable = "../agentscope(ref-backend)" }
+version = "2.0.7.post1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
     { name = "aioitertools" },
@@ -47,130 +48,20 @@ dependencies = [
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-sdk" },
     { name = "opentelemetry-semantic-conventions" },
+    { name = "pypdf" },
     { name = "python-datauri" },
     { name = "python-frontmatter" },
     { name = "python-socketio" },
+    { name = "rich" },
     { name = "shortuuid" },
     { name = "tree-sitter" },
     { name = "tree-sitter-bash" },
     { name = "tzdata" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "ag-ui-protocol", marker = "extra == 'service'", specifier = ">=0.1.10" },
-    { name = "agentscope", extras = ["full"], marker = "extra == 'dev'" },
-    { name = "agentscope", extras = ["memory"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["memory-mem0"], marker = "extra == 'mem0'" },
-    { name = "agentscope", extras = ["memory-mem0"], marker = "extra == 'memory'" },
-    { name = "agentscope", extras = ["memory-reme"], marker = "extra == 'memory'" },
-    { name = "agentscope", extras = ["memory-reme"], marker = "extra == 'reme'" },
-    { name = "agentscope", extras = ["model-gemini"], marker = "extra == 'gemini'" },
-    { name = "agentscope", extras = ["model-gemini"], marker = "extra == 'models'" },
-    { name = "agentscope", extras = ["model-ollama"], marker = "extra == 'models'" },
-    { name = "agentscope", extras = ["model-ollama"], marker = "extra == 'ollama'" },
-    { name = "agentscope", extras = ["model-xai"], marker = "extra == 'models'" },
-    { name = "agentscope", extras = ["model-xai"], marker = "extra == 'xai'" },
-    { name = "agentscope", extras = ["models"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["rag"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["service"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["storage-redis"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["storage-redis"], marker = "extra == 'storage'" },
-    { name = "agentscope", extras = ["storage-s3"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["storage-s3"], marker = "extra == 's3'" },
-    { name = "agentscope", extras = ["storage-sql"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["storage-sql"], marker = "extra == 'sql'" },
-    { name = "agentscope", extras = ["storage-sql"], marker = "extra == 'storage-mysql'" },
-    { name = "agentscope", extras = ["tools"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["vdb-elasticsearch"], marker = "extra == 'elasticsearch'" },
-    { name = "agentscope", extras = ["vdb-elasticsearch"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["vdb-milvus"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["vdb-milvus"], marker = "extra == 'milvuslite'" },
-    { name = "agentscope", extras = ["vdb-mongodb"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["vdb-mongodb"], marker = "extra == 'mongodb'" },
-    { name = "agentscope", extras = ["vdb-qdrant"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["workspace"], marker = "extra == 'full'" },
-    { name = "agentscope", extras = ["workspace-daytona"], marker = "extra == 'workspace'" },
-    { name = "agentscope", extras = ["workspace-docker"], marker = "extra == 'workspace'" },
-    { name = "agentscope", extras = ["workspace-e2b"], marker = "extra == 'workspace'" },
-    { name = "agentscope", extras = ["workspace-k8s"], marker = "extra == 'k8s'" },
-    { name = "agentscope", extras = ["workspace-k8s"], marker = "extra == 'workspace'" },
-    { name = "agentscope", extras = ["workspace-opensandbox"], marker = "extra == 'workspace'" },
-    { name = "aioboto3", marker = "extra == 'storage-s3'" },
-    { name = "aiodocker", marker = "extra == 'workspace-docker'" },
-    { name = "aiofiles" },
-    { name = "aioitertools" },
-    { name = "aiomysql", marker = "extra == 'storage-mysql'" },
-    { name = "aiosqlite", marker = "extra == 'dev'" },
-    { name = "alembic", marker = "extra == 'storage-sql'", specifier = ">=1.13" },
-    { name = "anthropic" },
-    { name = "apscheduler", marker = "extra == 'service'" },
-    { name = "boto3", marker = "extra == 'dev'" },
-    { name = "cryptography", marker = "extra == 'service'" },
-    { name = "dashscope" },
-    { name = "daytona", marker = "extra == 'workspace-daytona'" },
-    { name = "docstring-parser" },
-    { name = "e2b", marker = "extra == 'workspace-e2b'" },
-    { name = "elasticsearch", extras = ["async"], marker = "extra == 'vdb-elasticsearch'", specifier = ">=8.12" },
-    { name = "fakeredis", marker = "extra == 'dev'" },
-    { name = "fastapi", marker = "extra == 'service'" },
-    { name = "filetype" },
-    { name = "google-genai", marker = "extra == 'model-gemini'" },
-    { name = "html2text", marker = "extra == 'service'" },
-    { name = "httpx" },
-    { name = "jinja2" },
-    { name = "json-repair" },
-    { name = "json5" },
-    { name = "jsonschema" },
-    { name = "kubernetes-asyncio", marker = "extra == 'workspace-k8s'" },
-    { name = "markitdown", extras = ["all"], marker = "extra == 'service'" },
-    { name = "matplotlib", marker = "extra == 'dev'" },
-    { name = "mcp", specifier = "<2.0.0" },
-    { name = "mem0ai", marker = "extra == 'memory-mem0'", specifier = ">=2.0.0" },
-    { name = "milvus-lite", marker = "extra == 'vdb-milvus'", specifier = ">=3.1.0" },
-    { name = "moto", extras = ["s3", "server"], marker = "extra == 'dev'" },
-    { name = "myst-parser", marker = "extra == 'dev'" },
-    { name = "numpy" },
-    { name = "ollama", marker = "extra == 'model-ollama'", specifier = ">=0.5.4" },
-    { name = "openai" },
-    { name = "openpyxl", marker = "extra == 'rag'", specifier = ">=3.1.5" },
-    { name = "openpyxl", marker = "extra == 'service'" },
-    { name = "opensandbox", marker = "extra == 'workspace-opensandbox'" },
-    { name = "opentelemetry-api", specifier = ">=1.39.0" },
-    { name = "opentelemetry-exporter-otlp", specifier = ">=1.39.0" },
-    { name = "opentelemetry-sdk", specifier = ">=1.39.0" },
-    { name = "opentelemetry-semantic-conventions", specifier = ">=0.60b0" },
-    { name = "oss2", marker = "extra == 'service'" },
-    { name = "pandas", marker = "extra == 'rag'" },
-    { name = "pdfplumber", marker = "extra == 'service'" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
-    { name = "pymilvus", marker = "extra == 'vdb-milvus'", specifier = ">=2.4.0" },
-    { name = "pymongo", marker = "extra == 'vdb-mongodb'", specifier = ">=4.7" },
-    { name = "pypdf", marker = "extra == 'rag'" },
-    { name = "pytest", marker = "extra == 'dev'" },
-    { name = "pytest-forked", marker = "extra == 'dev'" },
-    { name = "python-datauri" },
-    { name = "python-docx", marker = "extra == 'rag'" },
-    { name = "python-docx", marker = "extra == 'service'" },
-    { name = "python-frontmatter" },
-    { name = "python-pptx", marker = "extra == 'rag'" },
-    { name = "python-pptx", marker = "extra == 'service'" },
-    { name = "python-socketio" },
-    { name = "qdrant-client", marker = "extra == 'vdb-qdrant'" },
-    { name = "redis", marker = "extra == 'storage-redis'" },
-    { name = "reme-ai", marker = "extra == 'memory-reme'", specifier = ">=0.4.0.6" },
-    { name = "reportlab", marker = "extra == 'dev'" },
-    { name = "ripgrep", marker = "extra == 'tools'" },
-    { name = "shortuuid" },
-    { name = "sqlalchemy", extras = ["asyncio"], marker = "extra == 'storage-sql'", specifier = ">=2.0" },
-    { name = "tree-sitter" },
-    { name = "tree-sitter-bash" },
-    { name = "tzdata" },
-    { name = "uvicorn", marker = "extra == 'service'" },
-    { name = "xai-sdk", marker = "extra == 'model-xai'" },
-    { name = "xlrd", marker = "extra == 'rag'", specifier = ">=2.0" },
+sdist = { url = "https://files.pythonhosted.org/packages/bd/88/1ebb93df0115b342596e1dd4364d98c28388b7ff95cd3cfeadab4bb7f439/agentscope-2.0.7.post1.tar.gz", hash = "sha256:cf847e7adfa2319ed7b13526f5a580507040cc87e9196edd7859c11ca99d3948", size = 890771, upload-time = "2026-08-28T02:42:51.132Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e5/46/a5aef211579c816cbac982e288d1a8c6126421deb588f5b3c924b9122564/agentscope-2.0.7.post1-py3-none-any.whl", hash = "sha256:3fffeb2b6e124c45d7c95a019afc4de73ed6c2a02880804da5b43a61634cc063", size = 1160942, upload-time = "2026-08-28T02:42:49.121Z" },
 ]
-provides-extras = ["model-gemini", "model-ollama", "model-xai", "models", "service", "storage-redis", "storage-sql", "storage-mysql", "storage-s3", "workspace-docker", "workspace-e2b", "workspace-daytona", "workspace-k8s", "workspace-opensandbox", "workspace", "tools", "vdb-qdrant", "vdb-milvus", "vdb-mongodb", "vdb-elasticsearch", "rag", "memory-mem0", "memory-reme", "memory", "gemini", "ollama", "xai", "storage", "sql", "s3", "k8s", "milvuslite", "mongodb", "elasticsearch", "mem0", "reme", "full", "dev"]
 
 [[package]]
 name = "agentscope-acp"
@@ -191,7 +82,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "agent-client-protocol", specifier = ">=0.9.0,<0.11.0" },
-    { name = "agentscope", editable = "../agentscope(ref-backend)" },
+    { name = "agentscope", specifier = "==2.0.7.post1" },
     { name = "pydantic", specifier = ">=2.0" },
 ]
 
@@ -2105,6 +1996,15 @@ wheels = [
 [package.optional-dependencies]
 crypto = [
     { name = "cryptography" },
+]
+
+[[package]]
+name = "pypdf"
+version = "6.16.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/66/54212e75406afd9f3e933d0dda23072f6aecc55c5a273077dc2e0b028b23/pypdf-6.16.2.tar.gz", hash = "sha256:595647f6191de6f402cfde1d0c455d6cbccbd509aac32b34783009c032de5d6e", size = 7008996, upload-time = "2026-08-23T13:50:07.135Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/f1/a2da3b55acd4ab737bf728c97edaaed5ec1d3c1236acb639dcdfa97e42c7/pypdf-6.16.2-py3-none-any.whl", hash = "sha256:c8b09a59399062fb45a1b8156c18a787a10a3dae03ac9674397a226712c94604", size = 385060, upload-time = "2026-08-23T13:50:05.349Z" },
 ]
 
 [[package]]

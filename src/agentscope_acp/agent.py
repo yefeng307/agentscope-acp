@@ -33,7 +33,6 @@ from acp.exceptions import RequestError
 from acp.interfaces import Client
 from acp.schema import (
     AgentCapabilities,
-    ConfigOptionUpdate,
     Implementation,
     ListSessionsResponse,
     ModelInfo,
@@ -468,13 +467,9 @@ class AgentScopeAcpAgent(Agent):
             model_id,
         )
         options = self._build_config_options(model_id)
-        await self._conn.session_update(
-            session_id=session_id,
-            update=ConfigOptionUpdate(
-                sessionUpdate="config_option_update",
-                config_options=options,
-            ),
-        )
+        # Note: no config_option_update notification here — the response
+        # itself carries the new options and ACP is a single-client link
+        # (QwenPaw likewise relies on the response only).
         return SetSessionConfigOptionResponse(config_options=options)
 
     # ------------------------------------------------------------------

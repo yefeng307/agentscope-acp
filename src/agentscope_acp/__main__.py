@@ -54,8 +54,7 @@ def main() -> None:
 
     _setup_logging(config)
     logger.info(
-        "starting agentscope-acp: provider=%s model=%s models=%d",
-        config.provider,
+        "starting agentscope-acp: model=%s models=%d",
         config.model,
         len(config.available_models),
     )

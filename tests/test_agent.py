@@ -110,7 +110,6 @@ class ForeverAgent:
 
 def _config() -> AcpConfig:
     return AcpConfig(
-        provider="dashscope",
         api_key=SecretStr("sk-test"),
         model="qwen3.6-plus",
         available_models=[
@@ -184,7 +183,7 @@ async def test_new_session_invalid_config_raises_request_error():
         mcp_clients=None,
         state=None,
     ):
-        raise ValueError("Missing DASHSCOPE_API_KEY")
+        raise ValueError("Missing OPENAI_API_KEY")
 
     acp_agent = AgentScopeAcpAgent(_config(), agent_factory=failing_factory)
     with pytest.raises(RequestError):
@@ -555,13 +554,6 @@ async def test_set_config_option_switches_model():
     assert response.config_options[0].current_value == "qwen3.6-max"
     # The live agent now uses the new model.
     assert fake.model.model == "qwen3.6-max"
-    # The client was notified of the change.
-    updates = [
-        u for _, u in acp_agent._conn.updates
-        if u.session_update == "config_option_update"
-    ]
-    assert len(updates) == 1
-    assert updates[0].config_options[0].current_value == "qwen3.6-max"
 
 
 async def test_set_config_option_unknown_id_raises():

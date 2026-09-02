@@ -59,7 +59,7 @@ async def main() -> int:
     env = dict(os.environ)
     # Fake key: model construction succeeds, the actual call fails later —
     # which is exactly the in-band error path we want to verify.
-    env["DASHSCOPE_API_KEY"] = "sk-smoke-test"
+    env["OPENAI_API_KEY"] = "sk-smoke-test"
 
     client = PrintClient()
     async with spawn_agent_process(

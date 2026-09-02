@@ -18,7 +18,6 @@ from pydantic import SecretStr
 
 logger = logging.getLogger(__name__)
 
-ENV_PROVIDER = "AGENTSCOPE_ACP_PROVIDER"
 ENV_MODEL = "AGENTSCOPE_ACP_MODEL"
 ENV_AVAILABLE_MODELS = "AGENTSCOPE_ACP_AVAILABLE_MODELS"
 ENV_SYSTEM_PROMPT = "AGENTSCOPE_ACP_SYSTEM_PROMPT"
@@ -28,9 +27,6 @@ ENV_SKILLS_DIR = "AGENTSCOPE_ACP_SKILLS_DIR"
 ENV_PERMISSION_MODE = "AGENTSCOPE_ACP_PERMISSION_MODE"
 ENV_SESSIONS_DIR = "AGENTSCOPE_ACP_SESSIONS_DIR"
 ENV_LOG = "AGENTSCOPE_ACP_LOG"
-
-PROVIDER_DASHSCOPE = "dashscope"
-PROVIDER_OPENAI_COMPAT = "openai-compat"
 
 PERMISSION_ACCEPT_EDITS = "accept_edits"
 PERMISSION_ASK = "ask"
@@ -65,7 +61,6 @@ class ModelEntry:
 class AcpConfig:
     """Runtime configuration resolved from environment variables."""
 
-    provider: str
     api_key: SecretStr
     model: str
     available_models: list[ModelEntry] = field(default_factory=list)
@@ -79,17 +74,10 @@ class AcpConfig:
 
     @classmethod
     def from_env(cls) -> "AcpConfig":
-        provider = os.environ.get(ENV_PROVIDER, PROVIDER_DASHSCOPE).strip().lower()
-        if provider not in (PROVIDER_DASHSCOPE, PROVIDER_OPENAI_COMPAT):
-            raise ValueError(
-                f"Unsupported {ENV_PROVIDER}: {provider!r} "
-                f"(expected {PROVIDER_DASHSCOPE!r} or {PROVIDER_OPENAI_COMPAT!r})",
-            )
-
-        if provider == PROVIDER_DASHSCOPE:
-            api_key = SecretStr(os.environ.get("DASHSCOPE_API_KEY", ""))
-        else:
-            api_key = SecretStr(os.environ.get("OPENAI_API_KEY", ""))
+        # OpenAI-compatible only: any endpoint that speaks the OpenAI chat
+        # completions format (DashScope compatible-mode, DeepSeek, vLLM,
+        # Ollama's OpenAI endpoint, ...) via OPENAI_API_KEY/OPENAI_BASE_URL.
+        api_key = SecretStr(os.environ.get("OPENAI_API_KEY", ""))
 
         model = os.environ.get(ENV_MODEL, "").strip() or DEFAULT_MODEL
 
@@ -125,7 +113,6 @@ class AcpConfig:
             permission_mode = PERMISSION_ACCEPT_EDITS
 
         return cls(
-            provider=provider,
             api_key=api_key,
             model=model,
             available_models=entries,
@@ -155,15 +142,6 @@ def _parse_bool(raw: str, default: bool) -> bool:
     if not raw or not raw.strip():
         return default
     return raw.strip().lower() not in ("0", "false", "no", "off")
-
-
-def api_key_env_name(provider: str) -> str:
-    """Human-readable env var name for error messages."""
-    return (
-        "DASHSCOPE_API_KEY"
-        if provider == PROVIDER_DASHSCOPE
-        else "OPENAI_API_KEY"
-    )
 
 
 def build_toolkit(
@@ -385,9 +363,8 @@ def build_chat_model(config: AcpConfig, model: str | None = None):
     model_name = model or config.model
 
     if not config.api_key:
-        env_name = api_key_env_name(config.provider)
         raise ValueError(
-            f"Missing {env_name}: set it in the agent's environment "
+            "Missing OPENAI_API_KEY: set it in the agent's environment "
             "(agent-work agent_catalog env or shell).",
         )
 
@@ -396,17 +373,6 @@ def build_chat_model(config: AcpConfig, model: str | None = None):
         if isinstance(config.api_key, SecretStr)
         else config.api_key
     )
-
-    if config.provider == PROVIDER_DASHSCOPE:
-        from agentscope.credential import DashScopeCredential
-        from agentscope.model import DashScopeChatModel
-
-        return DashScopeChatModel(
-            credential=DashScopeCredential(
-                api_key=SecretStr(key),
-            ),
-            model=model_name,
-        )
 
     from agentscope.credential import OpenAICredential
     from agentscope.model import OpenAIChatModel
