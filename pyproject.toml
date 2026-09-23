@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "agent-client-protocol>=0.10.1,<0.11.0",
-    "agentscope==2.0.7.post1",
+    "agentscope>=2.0.5",
     "pydantic>=2.0",
 ]
 
