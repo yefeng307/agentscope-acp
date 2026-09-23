@@ -120,7 +120,14 @@ class AcpConfig:
             or DEFAULT_SYSTEM_PROMPT,
             enable_tools=_parse_bool(os.environ.get(ENV_TOOLS, ""), True),
             tool_names=tool_names,
-            skills_dir=os.environ.get(ENV_SKILLS_DIR, "").strip() or None,
+            # expanduser like sessions_dir: hosts seed env values with "~"
+            # (agent-work's nativeSkillsDirs and AGENTSCOPE_ACP_SKILLS_DIR
+            # point at the same ~/.agentscope-acp/skills directory), and
+            # os.path.isdir would silently fail on the unexpanded form.
+            skills_dir=os.path.expanduser(
+                os.environ.get(ENV_SKILLS_DIR, "").strip(),
+            )
+            or None,
             permission_mode=permission_mode,
             sessions_dir=os.environ.get(ENV_SESSIONS_DIR, "").strip()
             or DEFAULT_SESSIONS_DIR,
