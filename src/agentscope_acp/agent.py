@@ -35,6 +35,8 @@ from acp.exceptions import RequestError
 from acp.interfaces import Client
 from acp.schema import (
     AgentCapabilities,
+    AllowedOutcome,
+    DeniedOutcome,
     Implementation,
     ListSessionsResponse,
     ModelInfo,
@@ -54,7 +56,12 @@ from acp.schema import (
 )
 
 from agentscope.agent import Agent as AgentScopeAgent
-from agentscope.event import ConfirmResult, RequireUserConfirmEvent, UserConfirmResultEvent
+from agentscope.event import (
+    ConfirmResult,
+    RequireUserConfirmEvent,
+    UserConfirmResultEvent,
+    UserInterruptEvent,
+)
 from agentscope.message import UserMsg
 from agentscope.permission import PermissionBehavior, PermissionRule
 from agentscope.state import AgentState
@@ -143,6 +150,52 @@ def _confirm_result(tool_call: Any, outcome: Any) -> ConfirmResult:
         ]
     confirmed = option_id in ("allow_once", "allow_always")
     return ConfirmResult(confirmed=confirmed, tool_call=tool_call, rules=rules)
+
+
+def _normalize_permission_outcome(raw: Any) -> AllowedOutcome | DeniedOutcome:
+    """Normalize a ``session/request_permission`` reply onto an SDK outcome.
+
+    Accepted shapes (unknown/absent shapes fail closed as "cancelled"):
+    - SDK models (simplified clients/tests): ``AllowedOutcome``/
+      ``DeniedOutcome``, optionally wrapped in a ``RequestPermissionResponse``.
+    - Standard ACP wire dict: ``{"outcome": {"outcome": "selected",
+      "optionId": ...}}`` / ``{"outcome": {"outcome": "cancelled"}}``.
+    - agent-work host shape: ``{"option": {"kind": "allow_once" | ...}}`` —
+      the host (packages/server/src/agent/acp/task.ts ``resolvePermission``)
+      answers with the chosen option kind instead of the standard envelope.
+    """
+    if isinstance(raw, (AllowedOutcome, DeniedOutcome)):
+        return raw
+    wrapped = getattr(raw, "outcome", None)
+    if wrapped is not None:  # RequestPermissionResponse model wrapper.
+        if isinstance(wrapped, (AllowedOutcome, DeniedOutcome)):
+            return wrapped
+    if isinstance(raw, dict):
+        outcome = raw.get("outcome")
+        if isinstance(outcome, dict):
+            if outcome.get("outcome") == "selected":
+                option_id = str(
+                    outcome.get("optionId") or outcome.get("option_id") or "",
+                )
+                return AllowedOutcome(outcome="selected", option_id=option_id)
+            return DeniedOutcome(outcome="cancelled")
+        option = raw.get("option")
+        if isinstance(option, dict):
+            kind = str(option.get("kind") or "")
+            if kind in ("allow_once", "allow_always", "reject_once", "reject_always"):
+                # "selected" only means the user picked an option;
+                # _confirm_result maps reject_* onto a refusal.
+                return AllowedOutcome(outcome="selected", option_id=kind)
+            # 'deny' (agent-work's cancel/timeout semantic) or unknown kind.
+            return DeniedOutcome(outcome="cancelled")
+    return DeniedOutcome(outcome="cancelled")
+
+
+def _saved_model(raw: Any) -> str | None:
+    """Read the model id persisted with a session (``_acp_meta.model_id``)."""
+    meta = raw.get("_acp_meta") if isinstance(raw, dict) else None
+    model_id = meta.get("model_id") if isinstance(meta, dict) else None
+    return model_id if isinstance(model_id, str) and model_id else None
 
 
 def _uri_to_path(uri: str) -> str:
@@ -333,16 +386,22 @@ class AgentScopeAcpAgent(Agent):
             )
         except ValueError as exc:
             raise RequestError.invalid_params({"details": str(exc)}) from None
+        model_id = self._restore_model(agent, _saved_model(raw))
         self._records[session_id] = SessionRecord(
             agent=agent,
             cwd=cwd,
             mcp_clients=clients,
             updated_at=_now_iso(),
-            model_id=self._config.model,
+            model_id=model_id,
         )
-        logger.info("load_session: id=%s cwd=%s", session_id, cwd)
+        logger.info(
+            "load_session: id=%s cwd=%s model=%s",
+            session_id,
+            cwd,
+            model_id,
+        )
         return LoadSessionResponse(
-            config_options=self._build_config_options(self._config.model),
+            config_options=self._build_config_options(model_id),
         )
 
     async def resume_session(  # pylint: disable=unused-argument
@@ -380,6 +439,7 @@ class AgentScopeAcpAgent(Agent):
             raw = json.loads(path.read_text(encoding="utf-8"))
             state = AgentState.model_validate(raw)
         except FileNotFoundError:
+            raw = None
             state = None
         except Exception as exc:
             raise RequestError.invalid_params(
@@ -396,25 +456,27 @@ class AgentScopeAcpAgent(Agent):
             )
         except ValueError as exc:
             raise RequestError.invalid_params({"details": str(exc)}) from None
+        model_id = self._restore_model(agent, _saved_model(raw))
         record = SessionRecord(
             agent=agent,
             cwd=cwd,
             mcp_clients=clients,
             updated_at=_now_iso(),
-            model_id=self._config.model,
+            model_id=model_id,
         )
         self._records[session_id] = record
         # Persist immediately so a later session/load (after a process
         # restart) finds the resurrected session.
         self._save_state(record, session_id)
         logger.info(
-            "resume_session: id=%s cwd=%s restored=%s",
+            "resume_session: id=%s cwd=%s restored=%s model=%s",
             session_id,
             cwd,
             state is not None,
+            model_id,
         )
         return ResumeSessionResponse(
-            config_options=self._build_config_options(self._config.model),
+            config_options=self._build_config_options(model_id),
         )
 
     async def _resolve_prompt_text(
@@ -511,6 +573,11 @@ class AgentScopeAcpAgent(Agent):
 
         translator = TurnTranslator()
         try:
+            # Self-heal a reply parked by an earlier, aborted turn (client
+            # died mid-ask, permission round-trip failed, ...) before the
+            # engine rejects this prompt with "Agent is waiting for N tool
+            # calls ... but received no event".
+            await self._recover_parked_reply(session_id, record.agent)
             await self._consume_events(
                 session_id,
                 record.agent,
@@ -730,59 +797,139 @@ class AgentScopeAcpAgent(Agent):
     ) -> None:
         """Drain one ``reply_stream`` generator into ACP updates.
 
-        A ``RequireUserConfirmEvent`` ends the generator by design: the
-        engine resumes from its saved state when fed the resulting
+        A ``RequireUserConfirmEvent`` parks the generator by design: the
+        engine resumes from its saved state when fed a
         ``UserConfirmResultEvent`` back through a fresh ``reply_stream``
-        call — recursed here so multi-step turns (asking several times)
-        keep streaming into the same ACP turn.
+        call — looped here so multi-step turns (asking several times) keep
+        streaming into the same ACP turn.
+
+        Every ask read from a parked stream MUST be answered before
+        resuming: a concurrent tool batch parks with one confirm event per
+        tool call, and the engine never re-sends asks it already surfaced
+        (``Agent.reply_stream`` note). Answering only the first ask left the
+        remaining tool calls stuck in ASKING forever, and the next prompt
+        died with "Agent is waiting for N tool calls ... but received no
+        event" (agentscope._agent._check_incoming_event).
         """
-        async for event in event_stream:
-            if isinstance(event, RequireUserConfirmEvent):
-                confirm_event = await self._request_permission(
-                    session_id,
-                    event,
-                )
-                await self._consume_events(
-                    session_id,
-                    agent,
-                    translator,
-                    agent.reply_stream(confirm_event),
-                )
+        while True:
+            pending: list[ConfirmResult] = []
+            reply_id: str | None = None
+            async for event in event_stream:
+                if isinstance(event, RequireUserConfirmEvent):
+                    if reply_id is None:
+                        reply_id = event.reply_id
+                    pending.extend(
+                        await self._request_permission(session_id, event),
+                    )
+                    continue
+                for update in translator.process(event):
+                    await self._conn.session_update(
+                        session_id=session_id,
+                        update=update,
+                    )
+            if not pending or reply_id is None:
                 return
-            for update in translator.process(event):
-                await self._conn.session_update(
-                    session_id=session_id,
-                    update=update,
-                )
+            # One resume event carries the decisions of every ask surfaced
+            # by the parked reply, so the engine unblocks the whole batch at
+            # once (it has no way to re-ask a subset).
+            event_stream = agent.reply_stream(
+                UserConfirmResultEvent(
+                    reply_id=reply_id,
+                    confirm_results=pending,
+                ),
+            )
 
     async def _request_permission(
         self,
         session_id: str,
         event: RequireUserConfirmEvent,
-    ) -> UserConfirmResultEvent:
-        """Ask the client for permission and build the resume event.
+    ) -> list[ConfirmResult]:
+        """Ask the client for the permission of one confirm event.
 
         ACP ``request_permission`` covers one tool call, so multi-tool
         confirmations are asked sequentially.
         """
         confirm_results = []
         for tool_call in event.tool_calls:
-            outcome = await self._conn.request_permission(
-                session_id=session_id,
-                tool_call=ToolCallUpdate(
-                    tool_call_id=tool_call.id,
-                    kind=_tool_kind(tool_call.name),
-                    status="pending",
-                    title=tool_call.name,
-                    raw_input=tool_call.input or None,
-                ),
-                options=PERMISSION_OPTIONS,
+            request = ToolCallUpdate(
+                tool_call_id=tool_call.id,
+                kind=_tool_kind(tool_call.name),
+                status="pending",
+                title=tool_call.name,
+                raw_input=tool_call.input or None,
             )
+            outcome = await self._request_permission_outcome(session_id, request)
             confirm_results.append(_confirm_result(tool_call, outcome))
-        return UserConfirmResultEvent(
-            reply_id=event.reply_id,
-            confirm_results=confirm_results,
+        return confirm_results
+
+    async def _request_permission_outcome(
+        self,
+        session_id: str,
+        tool_call: ToolCallUpdate,
+    ) -> AllowedOutcome | DeniedOutcome:
+        """Ask the client for a permission decision over the raw channel.
+
+        The SDK's typed ``Client.request_permission`` validates the reply as
+        a ``RequestPermissionResponse`` and rejects anything else - hosts
+        that answer with a non-standard shape (agent-work resolves
+        ``{option: {kind}}``) would fail validation after the RPC already
+        round-tripped, with no chance to retry. Send through
+        ``send_request`` and normalize the reply here instead.
+        """
+        raw = await self._conn.send_request(
+            "session/request_permission",
+            {
+                "sessionId": session_id,
+                "toolCall": tool_call.model_dump(by_alias=True, exclude_none=True),
+                "options": [
+                    option.model_dump(by_alias=True, exclude_none=True)
+                    for option in PERMISSION_OPTIONS
+                ],
+            },
         )
+        return _normalize_permission_outcome(raw)
+
+    async def _recover_parked_reply(
+        self,
+        session_id: str,
+        agent: AgentScopeAgent,
+    ) -> None:
+        """Close tool calls left awaiting input by an aborted turn.
+
+        When a previous prompt died while the engine was parked on
+        ``RequireUserConfirmEvent`` (or an external execution), the state
+        still holds those tool calls and every new prompt is rejected by
+        ``_check_incoming_event``. A ``UserInterruptEvent`` makes the engine
+        close them with INTERRUPTED results so the session becomes usable
+        again. The drain is silent: the throwaway translator drops the
+        INTERRUPTED results (nothing to show the client) and, crucially, the
+        turn's own translator stays free of the interrupt's stop reason and
+        usage.
+        """
+        state = getattr(agent, "state", None)
+        if state is None or not state.has_awaiting_tool_calls(agent.name):
+            return
+        logger.info(
+            "prompt: closing tool calls left awaiting input: session=%s",
+            session_id,
+        )
+        try:
+            await self._consume_events(
+                session_id,
+                agent,
+                TurnTranslator(),
+                agent.reply_stream(
+                    UserInterruptEvent(reply_id=state.reply_id),
+                ),
+            )
+        except Exception:
+            # Best-effort: if the recovery itself fails, the follow-up
+            # reply_stream reports the underlying problem in-band.
+            logger.warning(
+                "failed to close awaiting tool calls: session=%s",
+                session_id,
+                exc_info=True,
+            )
 
     async def _send_usage(
         self,
@@ -843,6 +990,32 @@ class AgentScopeAcpAgent(Agent):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _restore_model(
+        self,
+        agent: AgentScopeAgent,
+        saved_model: str | None,
+    ) -> str:
+        """Re-apply the model persisted with a session (best-effort).
+
+        Without this, ``load_session``/``resume_session`` rebuild the agent
+        with the environment model and the client's model selector (and the
+        host's initial-model logic) snaps back to it after every runtime
+        recreation (process restart, reset). Returns the effective model id.
+        """
+        if not saved_model or saved_model == self._config.model:
+            return self._config.model
+        try:
+            agent.model = build_chat_model(self._config, model=saved_model)
+        except ValueError:
+            logger.warning(
+                "failed to restore model %r — falling back to %r",
+                saved_model,
+                self._config.model,
+                exc_info=True,
+            )
+            return self._config.model
+        return saved_model
+
     @staticmethod
     def _default_agent_factory(
         config: AcpConfig,
@@ -891,6 +1064,10 @@ class AgentScopeAcpAgent(Agent):
                 id=CONFIG_OPTION_MODEL,
                 name="模型",
                 description="Select the model used by the agent",
+                # category lets the host's buildConfigOptionsFromAdvertised
+                # treat this as THE model option instead of synthesizing a
+                # duplicate from the legacy models state.
+                category="model",
                 current_value=current_model,
                 options=[
                     SessionConfigSelectOption(

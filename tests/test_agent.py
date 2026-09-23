@@ -16,13 +16,16 @@ from acp.exceptions import RequestError
 from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
+    DeniedOutcome,
     EmbeddedResourceContentBlock,
     FileSystemCapabilities,
+    PermissionOption,
     ReadTextFileResponse,
     RequestPermissionResponse,
     ResourceContentBlock,
     TextContentBlock,
     TextResourceContents,
+    ToolCallUpdate,
 )
 from agentscope.event import (
     ModelCallEndEvent,
@@ -36,9 +39,10 @@ from agentscope.event import (
     ToolResultStartEvent,
     ToolResultTextDeltaEvent,
     UserConfirmResultEvent,
+    UserInterruptEvent,
 )
 from agentscope.event._event import ToolResultState
-from agentscope.message import ToolCallBlock
+from agentscope.message import ToolCallBlock, ToolCallState, ToolResultBlock
 from agentscope.state import AgentState
 from agentscope.types import ReplyFinishedReason
 from pydantic import SecretStr
@@ -68,22 +72,26 @@ class RecordingConn:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         self.updates.append((session_id, update))
 
-    async def request_permission(
-        self,
-        session_id: str,
-        tool_call: Any,
-        options: list[Any],
-        **kwargs: Any,
-    ) -> Any:
-        self.permission_requests.append((session_id, tool_call, options))
+    async def send_request(self, method: str, params: Any, **kwargs: Any) -> Any:
+        """Raw request channel — the agent sends session/request_permission
+        through it (see _request_permission_outcome) so the reply shape is
+        whatever the fake hands back: SDK models, the standard wire dict, or
+        a host shortcut like agent-work's {option: {kind}}."""
+        assert method == "session/request_permission", method
+        # Rebuild models from the wire dicts so existing property-access
+        # assertions keep working.
+        self.permission_requests.append(
+            (
+                params["sessionId"],
+                ToolCallUpdate.model_validate(params["toolCall"]),
+                [PermissionOption.model_validate(o) for o in params["options"]],
+            )
+        )
         if self._outcomes:
             return self._outcomes.pop(0)
-        # Real clients wrap the outcome: RequestPermissionResponse.outcome is
-        # the AllowedOutcome model (verified against a Zed capture). Use that
-        # shape by default so _confirm_result's nesting handling is exercised.
-        return RequestPermissionResponse(
-            outcome=AllowedOutcome(outcome="selected", option_id="allow_once"),
-        )
+        # Default to the standard wire dict shape (what a spec-compliant
+        # host answers).
+        return {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
 
     async def read_text_file(
         self,
@@ -106,6 +114,8 @@ class FakeAgentScopeAgent:
     the next ``reply_stream`` call resumes right after it (the resume event
     passed in ``inputs``).
     """
+
+    name = "agentscope-acp"
 
     def __init__(self, events: list[Any] | None = None, error: Exception | None = None):
         self.events = events or []
@@ -132,6 +142,8 @@ class FakeAgentScopeAgent:
 
 class ForeverAgent:
     """Agent whose stream never ends — used for cancel testing."""
+
+    name = "agentscope-acp"
 
     def __init__(self) -> None:
         self.received: list[Any] = []
@@ -600,8 +612,6 @@ async def test_prompt_allow_always_adds_permission_rule():
 
 
 async def test_prompt_cancelled_permission_is_rejection():
-    from acp.schema import DeniedOutcome
-
     fake = FakeAgentScopeAgent(_permission_events())
     acp_agent = _make_agent(
         fake,
@@ -643,6 +653,277 @@ async def test_prompt_permission_nested_response_shape():
     resume = fake.received[1]
     assert isinstance(resume, UserConfirmResultEvent)
     assert resume.confirm_results[0].confirmed is True
+
+
+async def test_permission_host_option_kind_shape_allows():
+    """agent-work answers session/request_permission with {option: {kind}}
+    instead of the standard outcome envelope (packages/server/src/agent/acp/
+    task.ts resolvePermission). allow_* kinds must permit the tool."""
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[{"option": {"kind": "allow_once"}}],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is True
+
+
+async def test_permission_host_option_kind_shape_rejects():
+    """agent-work's 'deny' (cancel/timeout semantic) and reject_once kinds
+    must refuse the tool instead of permitting it."""
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[{"option": {"kind": "deny"}}],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is False
+
+
+async def test_permission_standard_wire_dict_shape():
+    """Spec-compliant hosts answer with the camelCase outcome envelope."""
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[
+            {"outcome": {"outcome": "selected", "optionId": "allow_once"}},
+        ],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is True
+
+
+async def test_permission_unknown_shape_fails_closed():
+    """Unrecognized reply shapes must refuse (never hang or permit)."""
+    fake = FakeAgentScopeAgent(_permission_events())
+    acp_agent = _make_agent(
+        fake,
+        permission_outcomes=[{"unexpected": True}],
+    )
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.prompt(
+        prompt=_prompt_blocks("delete it"),
+        session_id=session.session_id,
+    )
+
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert resume.confirm_results[0].confirmed is False
+
+
+# ----------------------------------------------------------------------
+# concurrent confirmations (one parked stream, several asks)
+# ----------------------------------------------------------------------
+
+class ConcurrentConfirmFakeAgent:
+    """Mirrors the engine's concurrent tool batch: several asks surface in
+    ONE parked stream, and a resume must cover every ask because the engine
+    never re-sends asks it already surfaced (``Agent.reply_stream`` note)."""
+
+    name = "agentscope-acp"
+
+    def __init__(self) -> None:
+        self.received: list[Any] = []
+        self.state = AgentState()
+        self.model: Any = None
+
+    async def reply_stream(self, inputs: Any = None, **kwargs: Any):
+        self.received.append(inputs)
+        if not isinstance(inputs, UserConfirmResultEvent):
+            # First prompt: the batch parks with two asks, one per tool call.
+            yield ToolCallStartEvent(
+                reply_id="r1", tool_call_id="c1", tool_call_name="Read",
+            )
+            yield ToolCallStartEvent(
+                reply_id="r1", tool_call_id="c2", tool_call_name="Read",
+            )
+            yield RequireUserConfirmEvent(
+                reply_id="r1",
+                tool_calls=[
+                    ToolCallBlock(
+                        id="c1", name="Read", input='{"file_path": "a"}',
+                    ),
+                ],
+            )
+            yield RequireUserConfirmEvent(
+                reply_id="r1",
+                tool_calls=[
+                    ToolCallBlock(
+                        id="c2", name="Read", input='{"file_path": "b"}',
+                    ),
+                ],
+            )
+            return
+        # Resume: without a decision for every ASKING call the engine parks
+        # again silently - it never re-asks - and the turn dead-ends.
+        covered = {result.tool_call.id for result in inputs.confirm_results}
+        if covered != {"c1", "c2"}:
+            return
+        for tool_call_id in ("c1", "c2"):
+            yield ToolResultStartEvent(
+                reply_id="r1", tool_call_id=tool_call_id,
+                tool_call_name="Read",
+            )
+            yield ToolResultTextDeltaEvent(
+                reply_id="r1", tool_call_id=tool_call_id, delta="body",
+            )
+            yield ToolResultEndEvent(
+                reply_id="r1", tool_call_id=tool_call_id,
+                state=ToolResultState.SUCCESS,
+            )
+        yield ReplyEndEvent(session_id="s", reply_id="r1")
+
+
+async def test_prompt_answers_all_concurrent_confirms_before_resuming():
+    """A concurrent batch parks with one ask per tool call; answering only
+    the first stranded the rest in ASKING and poisoned the next prompt
+    ("Agent is waiting for 1 tool calls ... but received no event")."""
+    fake = ConcurrentConfirmFakeAgent()
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.prompt(
+        prompt=_prompt_blocks("read both files"),
+        session_id=session.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    conn = acp_agent._conn
+    # Every ask of the parked batch reached the client...
+    assert [r[1].tool_call_id for r in conn.permission_requests] == [
+        "c1",
+        "c2",
+    ]
+    # ...and ONE resume event carried both decisions.
+    assert len(fake.received) == 2
+    resume = fake.received[1]
+    assert isinstance(resume, UserConfirmResultEvent)
+    assert [result.tool_call.id for result in resume.confirm_results] == [
+        "c1",
+        "c2",
+    ]
+    # The batch executed to completion instead of dead-ending parked.
+    statuses = [
+        (u.tool_call_id, u.status)
+        for _, u in conn.updates
+        if u.session_update == "tool_call_update"
+    ]
+    assert statuses == [("c1", "completed"), ("c2", "completed")]
+
+
+# ----------------------------------------------------------------------
+# recovery of sessions parked by an earlier aborted turn
+# ----------------------------------------------------------------------
+
+class ParkedStateFakeAgent:
+    """Agent whose state still parks an ASKING tool call from an earlier
+    aborted turn; mirrors the engine's interrupt short-circuit."""
+
+    name = "agentscope-acp"
+
+    def __init__(self) -> None:
+        self.state = AgentState()
+        self.state.append_context(
+            self.name,
+            [
+                ToolCallBlock(
+                    id="c9",
+                    name="Bash",
+                    input='{"cmd": "rm x"}',
+                    state=ToolCallState.ASKING,
+                ),
+            ],
+        )
+        self.received: list[Any] = []
+        self.model: Any = None
+
+    async def reply_stream(self, inputs: Any = None, **kwargs: Any):
+        self.received.append(inputs)
+        if isinstance(inputs, UserInterruptEvent):
+            # Engine: close every awaiting call, end the reply INTERRUPTED.
+            for block in self.state.get_unfinished_tool_calls(self.name):
+                block.state = ToolCallState.FINISHED
+                self.state.context[-1].content.append(
+                    ToolResultBlock(
+                        id=block.id,
+                        name=block.name,
+                        output="interrupted",
+                        state=ToolResultState.INTERRUPTED,
+                    ),
+                )
+                yield ToolResultEndEvent(
+                    reply_id=self.state.reply_id,
+                    tool_call_id=block.id,
+                    state=ToolResultState.INTERRUPTED,
+                )
+            yield ReplyEndEvent(
+                session_id="s",
+                reply_id=self.state.reply_id,
+                finished_reason=ReplyFinishedReason.INTERRUPTED,
+            )
+            return
+        # Engine _check_incoming_event: a new message while parked raises.
+        if self.state.has_awaiting_tool_calls(self.name):
+            raise ValueError(
+                "Agent is waiting for 1 tool calls and external execution "
+                "results for 0 tool calls, but received no event.",
+            )
+        yield TextBlockDeltaEvent(reply_id="r2", block_id="b1", delta="ok")
+        yield ReplyEndEvent(session_id="s", reply_id="r2")
+
+
+async def test_prompt_recovers_session_parked_on_earlier_turn():
+    """A prompt on a session left parked (client died mid-ask, permission
+    round-trip failed, ...) must close the awaiting calls and proceed
+    instead of failing with the engine's "waiting for N tool calls" error."""
+    fake = ParkedStateFakeAgent()
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    response = await acp_agent.prompt(
+        prompt=_prompt_blocks("hello again"),
+        session_id=session.session_id,
+    )
+
+    assert response.stop_reason == "end_turn"
+    # The parked reply was closed with an interrupt BEFORE the new message.
+    assert isinstance(fake.received[0], UserInterruptEvent)
+    assert fake.received[0].reply_id
+    assert _received_text(fake.received[1]) == "hello again"
+    # The turn streamed normally: no in-band error chunk, and no cancelled
+    # stop reason leaked from the recovery drain.
+    texts = [
+        u.content.text
+        for _, u in acp_agent._conn.updates
+        if u.session_update == "agent_message_chunk"
+    ]
+    assert texts == ["ok"]
 
 
 # ----------------------------------------------------------------------
@@ -974,6 +1255,62 @@ async def test_resume_session_creates_fresh_when_unknown(tmp_path):
     assert response.config_options[0].current_value == "qwen3.6-plus"
     saved = tmp_path / "brandnew.json"
     assert saved.exists()
+
+
+def _state_with_saved_model(model_id: str) -> str:
+    """A persisted session payload carrying the _acp_meta block written by
+    _save_state (cwd/title/.../model_id)."""
+    payload = json.loads(AgentState().model_dump_json())
+    payload["_acp_meta"] = {"cwd": "/tmp", "model_id": model_id}
+    return json.dumps(payload)
+
+
+async def test_load_session_restores_saved_model(tmp_path):
+    """The model chosen at runtime must survive a session/load (process
+    restart): without it the rebuilt agent runs the env model and the
+    selector snaps back to it."""
+    config = _config()
+    config.sessions_dir = str(tmp_path)
+    saved = tmp_path / "saved2.json"
+    saved.write_text(
+        _state_with_saved_model("qwen3.6-max"),
+        encoding="utf-8",
+    )
+
+    fake = FakeAgentScopeAgent()
+    acp_agent = AgentScopeAcpAgent(
+        config,
+        agent_factory=lambda cfg, cwd, mcp_clients=None, state=None: fake,
+    )
+    acp_agent.on_connect(RecordingConn())
+
+    response = await acp_agent.load_session(cwd="/tmp", session_id="saved2")
+
+    assert response.config_options[0].current_value == "qwen3.6-max"
+    assert fake.model.model == "qwen3.6-max"
+    assert acp_agent._records["saved2"].model_id == "qwen3.6-max"
+
+
+async def test_resume_session_restores_saved_model_from_disk(tmp_path):
+    config = _config()
+    config.sessions_dir = str(tmp_path)
+    saved = tmp_path / "resume2.json"
+    saved.write_text(
+        _state_with_saved_model("qwen3.6-max"),
+        encoding="utf-8",
+    )
+
+    fake = FakeAgentScopeAgent()
+    acp_agent = AgentScopeAcpAgent(
+        config,
+        agent_factory=lambda cfg, cwd, mcp_clients=None, state=None: fake,
+    )
+    acp_agent.on_connect(RecordingConn())
+
+    response = await acp_agent.resume_session(cwd="/tmp", session_id="resume2")
+
+    assert response.config_options[0].current_value == "qwen3.6-max"
+    assert fake.model.model == "qwen3.6-max"
 
 
 # ----------------------------------------------------------------------
