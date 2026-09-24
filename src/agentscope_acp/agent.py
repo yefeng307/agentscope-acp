@@ -191,6 +191,23 @@ def _normalize_permission_outcome(raw: Any) -> AllowedOutcome | DeniedOutcome:
     return DeniedOutcome(outcome="cancelled")
 
 
+def _resolve_send_request(conn: Any) -> Any:
+    """Resolve a raw JSON-RPC ``send_request`` callable on a connection.
+
+    ``AgentSideConnection`` (agent-client-protocol 0.10.x) does not expose
+    ``send_request`` itself: it only carries typed, response-validating
+    methods plus ``ext_method``/``ext_notification`` (which prefix the
+    method name with an underscore). The generic ``send_request`` lives on
+    the wrapped ``Connection`` (``conn._conn``). Prefer the direct method
+    (tests fakes / future SDK versions), fall back to the wrapped one,
+    return ``None`` when neither exists.
+    """
+    send_request = getattr(conn, "send_request", None)
+    if send_request is not None:
+        return send_request
+    return getattr(getattr(conn, "_conn", None), "send_request", None)
+
+
 def _saved_model(raw: Any) -> str | None:
     """Read the model id persisted with a session (``_acp_meta.model_id``)."""
     meta = raw.get("_acp_meta") if isinstance(raw, dict) else None
@@ -873,10 +890,16 @@ class AgentScopeAcpAgent(Agent):
         a ``RequestPermissionResponse`` and rejects anything else - hosts
         that answer with a non-standard shape (agent-work resolves
         ``{option: {kind}}``) would fail validation after the RPC already
-        round-tripped, with no chance to retry. Send through
-        ``send_request`` and normalize the reply here instead.
+        round-tripped, with no chance to retry. Send through the raw
+        ``send_request`` channel (see ``_resolve_send_request``) and
+        normalize the reply here instead.
         """
-        raw = await self._conn.send_request(
+        send_request = _resolve_send_request(self._conn)
+        if send_request is None:
+            raise RequestError.internal_error(
+                {"details": "connection does not support raw requests"},
+            )
+        raw = await send_request(
             "session/request_permission",
             {
                 "sessionId": session_id,
