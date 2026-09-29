@@ -131,7 +131,8 @@ cd agentscope-acp
 uv sync
 ```
 
-依赖中的 `agentscope` 使用官方 PyPI 发布版（`2.0.7.post1`）
+依赖中的 `agentscope` 使用官方 PyPI 发布版，`pyproject.toml` 约束为 `>=2.0.5`，
+`uv.lock` 当前锁定 `2.0.5`（用 `uv lock --upgrade-package agentscope` 可升到最新）
 
 ### 冒烟测试
 
