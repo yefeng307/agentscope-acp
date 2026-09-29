@@ -54,6 +54,55 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `AGENTSCOPE_ACP_PERMISSION_MODE` | 否 | `ask` | `accept_edits`（编辑器操作自动放行，其余拦截）或 `ask`（逐操作审批，默认） |
 | `AGENTSCOPE_ACP_SESSIONS_DIR` | 否 | `~/.agentscope-acp/sessions` | AgentState 持久化目录（每会话一个 JSON） |
 | `AGENTSCOPE_ACP_LOG` | 否 | 关闭 | 文件日志路径（stdout 被 ACP 协议占用，绝不写 stdout） |
+| `AGENTSCOPE_ACP_CONFIG` | 否 | 见下 | 显式指定 YAML 配置文件路径（支持 `~`；缺失/格式错误则启动失败） |
+
+## 配置文件（可选）
+
+环境变量之外，支持一个可选的 YAML 配置文件提供默认值。优先级：
+**环境变量 > 配置文件 > 内置默认值**（agent-work 的 agent_catalog
+`env` 字段仍然可以逐项覆盖配置文件，per-agent 配置能力不受影响）。
+
+查找顺序（只加载第一个存在的文件）：
+
+1. `AGENTSCOPE_ACP_CONFIG` 显式指定（支持 `~`；文件缺失或格式错误
+   直接启动失败，退出码 2 —— 显式指定即明确意图，不静默降级）
+2. `./agentscope-acp.yaml`（进程工作目录；agent-work 以工作区为 cwd
+   spawn，放在项目根目录即可实现 per-project 配置）
+3. `~/.agentscope-acp/config.yaml`（用户级全局兜底）
+
+示例（`agentscope-acp.yaml`，所有键均可选）：
+
+```yaml
+model: qwen3.6-plus
+available_models: [qwen3.6-plus, qwen3-max]   # 列表或逗号分隔字符串
+base_url: https://api.deepseek.com/v1          # 模型请求地址
+# api_key: sk-...                               # 可选；密钥建议仍走环境变量
+system_prompt: |
+  你是一个严谨的编程助手。
+  用中文回复，代码风格保持项目一致。
+tools: true
+tool_names: [Bash, Read, Write, Edit, Grep, Glob]
+skills_dir: ~/.agentscope-acp/skills
+permission_mode: accept_edits
+sessions_dir: ~/.agentscope-acp/sessions
+log: ~/.agentscope-acp/agent.log
+```
+
+配置键与环境变量的对应关系：
+
+| 配置键 | 对应环境变量 | 说明 |
+|--------|-------------|------|
+| `model` | `AGENTSCOPE_ACP_MODEL` | 当前模型 |
+| `available_models` | `AGENTSCOPE_ACP_AVAILABLE_MODELS` | 列表或逗号分隔字符串 |
+| `system_prompt` | `AGENTSCOPE_ACP_SYSTEM_PROMPT` | 系统提示词 |
+| `base_url` | `OPENAI_BASE_URL` | 模型请求地址 |
+| `api_key` | `OPENAI_API_KEY` | API key（建议走环境变量） |
+| `tools` | `AGENTSCOPE_ACP_TOOLS` | 是否启用工具集 |
+| `tool_names` | `AGENTSCOPE_ACP_TOOL_NAMES` | 工具白名单 |
+| `skills_dir` | `AGENTSCOPE_ACP_SKILLS_DIR` | Skills 目录 |
+| `permission_mode` | `AGENTSCOPE_ACP_PERMISSION_MODE` | 权限模式 |
+| `sessions_dir` | `AGENTSCOPE_ACP_SESSIONS_DIR` | 会话持久化目录 |
+| `log` | `AGENTSCOPE_ACP_LOG` | 日志文件路径 |
 
 ## Skill（Agent Skills）
 
@@ -106,7 +155,8 @@ uv sync                # 开发调试：uv run agentscope-acp
 uv tool install .      # 安装为可执行文件（~/.local/bin/agentscope-acp）
 ```
 
-agent-work 侧在 seed.ts 的 agent_catalog（或设置页「自定义 Agent」）中添加：
+agent-work 侧在 seed.ts 的 agent_catalog（或设置页「自定义 Agent」）中添加（密钥仍走
+`env`，其余配置交给配置文件，用 `AGENTSCOPE_ACP_CONFIG` 显式指定路径）：
 
 ```json
 {
@@ -114,12 +164,23 @@ agent-work 侧在 seed.ts 的 agent_catalog（或设置页「自定义 Agent」�
   "args": [],
   "nativeSkillsDirs": ["~/.agentscope-acp/skills"],
   "env": {
-    "OPENAI_API_KEY": "sk-...",
-    "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
-    "AGENTSCOPE_ACP_MODEL": "DeepSeek-V4-Flash",
-    "AGENTSCOPE_ACP_SKILLS_DIR": "~/.agentscope-acp/skills"
+    "AGENTSCOPE_ACP_CONFIG": "~/.agentscope-acp/agentscope-acp.yaml"
   }
 }
+```
+
+配置文件内容（路径支持 `~`；不显式指定时也可靠项目根目录
+`./agentscope-acp.yaml` 或用户级 `~/.agentscope-acp/config.yaml` 自动发现，
+见上文「配置文件」章节）：
+
+```yaml
+# ~/.agentscope-acp/agentscope-acp.yaml
+base_url: https://api.deepseek.com/v1
+model: DeepSeek-V4-Flash
+system_prompt: |
+  你是一个严谨的编程助手。
+  用中文回复，代码风格与项目保持一致。
+skills_dir: ~/.agentscope-acp/skills
 ```
 
 与 pi-agent（seed.ts 里 `command: "pi-acp"`）同模式，需要注意：
@@ -128,7 +189,7 @@ agent-work 侧在 seed.ts 的 agent_catalog（或设置页「自定义 Agent」�
   经服务器进程的 PATH 解析。服务方式运行时需保证 uv tool 安装目录
   （默认 `~/.local/bin`）在 PATH 中，或 `command` 写安装后的绝对路径。
 - Skill：前端启用的 skills 软链进 `nativeSkillsDirs`（与 pi-agent 同机制），
-  必须与 `AGENTSCOPE_ACP_SKILLS_DIR` 指向同一目录。
+  必须与配置文件的 `skills_dir`（或 `AGENTSCOPE_ACP_SKILLS_DIR`）指向同一目录。
 - 模型选择器：Guid 首页数据来自 `probeAgentHandshake`（`initialize` +
   `session/new` → 读取响应 `models` 字段）；本项目在 `session/new` 响应中返回
   `SessionModelState`（current_model_id + available_models），前端开箱可用。

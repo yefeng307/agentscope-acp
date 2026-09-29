@@ -867,7 +867,14 @@ class ParkedStateFakeAgent:
         self.received.append(inputs)
         if isinstance(inputs, UserInterruptEvent):
             # Engine: close every awaiting call, end the reply INTERRUPTED.
-            for block in self.state.get_unfinished_tool_calls(self.name):
+            # agentscope >= 2.0.7 renamed get_awaiting_tool_calls to
+            # get_unfinished_tool_calls — support both.
+            getter = getattr(
+                self.state,
+                "get_unfinished_tool_calls",
+                None,
+            ) or getattr(self.state, "get_awaiting_tool_calls")
+            for block in getter(self.name):
                 block.state = ToolCallState.FINISHED
                 self.state.context[-1].content.append(
                     ToolResultBlock(

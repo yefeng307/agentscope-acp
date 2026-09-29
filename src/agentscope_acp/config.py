@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """Environment-based configuration for agentscope-acp.
 
-All knobs are environment variables so that ACP clients (agent-work's
-``agent_catalog`` row) can configure the agent per-agent without config
-files. stdout is reserved for the ACP protocol — logging goes to stderr
-or a file only.
+Configuration comes from three layers, highest priority first:
+
+1. environment variables (agent-work's ``agent_catalog`` env row, so ACP
+   clients keep per-agent control),
+2. an optional YAML config file (see ``find_config_file`` for the search
+   order),
+3. built-in defaults.
+
+stdout is reserved for the ACP protocol — logging goes to stderr or a
+file only.
 """
 from __future__ import annotations
 
@@ -27,6 +33,16 @@ ENV_SKILLS_DIR = "AGENTSCOPE_ACP_SKILLS_DIR"
 ENV_PERMISSION_MODE = "AGENTSCOPE_ACP_PERMISSION_MODE"
 ENV_SESSIONS_DIR = "AGENTSCOPE_ACP_SESSIONS_DIR"
 ENV_LOG = "AGENTSCOPE_ACP_LOG"
+ENV_CONFIG = "AGENTSCOPE_ACP_CONFIG"
+
+# Config-file search order (first existing file wins; only ONE file is
+# loaded). AGENTSCOPE_ACP_CONFIG points at an explicit file: a missing or
+# unparseable file is then a hard startup error. The two search paths are
+# optional — problems there are warned and skipped.
+CONFIG_FILE_PROJECT = "agentscope-acp.yaml"
+# agent-work spawns the process with cwd=workspace, so the project-local
+# file above is per-workspace; this one is the per-user global fallback.
+CONFIG_FILE_USER = "~/.agentscope-acp/config.yaml"
 
 PERMISSION_ACCEPT_EDITS = "accept_edits"
 PERMISSION_ASK = "ask"
@@ -63,6 +79,7 @@ class AcpConfig:
 
     api_key: SecretStr
     model: str
+    base_url: str | None = None
     available_models: list[ModelEntry] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
@@ -76,12 +93,37 @@ class AcpConfig:
     def from_env(cls) -> "AcpConfig":
         # OpenAI-compatible only: any endpoint that speaks the OpenAI chat
         # completions format (DashScope compatible-mode, DeepSeek, vLLM,
-        # Ollama's OpenAI endpoint, ...) via OPENAI_API_KEY/OPENAI_BASE_URL.
-        api_key = SecretStr(os.environ.get("OPENAI_API_KEY", ""))
+        # Ollama's OpenAI endpoint, ...) via OPENAI_API_KEY/OPENAI_BASE_URL
+        # (or the ``api_key``/``base_url`` keys of the config file).
+        found = find_config_file()
+        file_values = load_config_file(*found) if found else {}
 
-        model = os.environ.get(ENV_MODEL, "").strip() or DEFAULT_MODEL
+        api_key = SecretStr(
+            _pick(
+                os.environ.get("OPENAI_API_KEY", ""),
+                file_values.get("api_key"),
+                "",
+            ),
+        )
+        base_url = (
+            _pick(
+                os.environ.get("OPENAI_BASE_URL", ""),
+                file_values.get("base_url"),
+                "",
+            )
+            or None
+        )
+        model = _pick(
+            os.environ.get(ENV_MODEL, ""),
+            file_values.get("model"),
+            DEFAULT_MODEL,
+        )
 
-        raw_list = os.environ.get(ENV_AVAILABLE_MODELS, "").strip()
+        raw_list = _pick(
+            os.environ.get(ENV_AVAILABLE_MODELS, ""),
+            _as_csv(file_values.get("available_models")),
+            "",
+        )
         if raw_list:
             entries = [
                 ModelEntry(model_id=part.strip(), name=part.strip())
@@ -93,16 +135,21 @@ class AcpConfig:
         if model not in {e.model_id for e in entries}:
             entries.insert(0, ModelEntry(model_id=model, name=model))
 
-        raw_names = os.environ.get(ENV_TOOL_NAMES, "").strip()
+        raw_names = _pick(
+            os.environ.get(ENV_TOOL_NAMES, ""),
+            _as_csv(file_values.get("tool_names")),
+            "",
+        )
         tool_names = (
             [part.strip() for part in raw_names.split(",") if part.strip()]
             or None
         )
 
-        permission_mode = os.environ.get(
-            ENV_PERMISSION_MODE,
+        permission_mode = _pick(
+            os.environ.get(ENV_PERMISSION_MODE, ""),
+            file_values.get("permission_mode"),
             PERMISSION_ACCEPT_EDITS,
-        ).strip().lower()
+        ).lower()
         if permission_mode not in PERMISSION_MODES:
             logger.warning(
                 "unknown %s %r — falling back to %r",
@@ -114,25 +161,116 @@ class AcpConfig:
 
         return cls(
             api_key=api_key,
+            base_url=base_url,
             model=model,
             available_models=entries,
-            system_prompt=os.environ.get(ENV_SYSTEM_PROMPT, "").strip()
-            or DEFAULT_SYSTEM_PROMPT,
-            enable_tools=_parse_bool(os.environ.get(ENV_TOOLS, ""), True),
+            system_prompt=_pick(
+                os.environ.get(ENV_SYSTEM_PROMPT, ""),
+                file_values.get("system_prompt"),
+                DEFAULT_SYSTEM_PROMPT,
+            ),
+            enable_tools=_parse_bool(
+                _pick(
+                    os.environ.get(ENV_TOOLS, ""),
+                    file_values.get("tools"),
+                    "",
+                ),
+                True,
+            ),
             tool_names=tool_names,
             # expanduser like sessions_dir: hosts seed env values with "~"
             # (agent-work's nativeSkillsDirs and AGENTSCOPE_ACP_SKILLS_DIR
             # point at the same ~/.agentscope-acp/skills directory), and
             # os.path.isdir would silently fail on the unexpanded form.
             skills_dir=os.path.expanduser(
-                os.environ.get(ENV_SKILLS_DIR, "").strip(),
+                _pick(
+                    os.environ.get(ENV_SKILLS_DIR, ""),
+                    file_values.get("skills_dir"),
+                    "",
+                ),
             )
             or None,
             permission_mode=permission_mode,
-            sessions_dir=os.environ.get(ENV_SESSIONS_DIR, "").strip()
-            or DEFAULT_SESSIONS_DIR,
-            log_path=os.environ.get(ENV_LOG, "").strip() or None,
+            sessions_dir=_pick(
+                os.environ.get(ENV_SESSIONS_DIR, ""),
+                file_values.get("sessions_dir"),
+                DEFAULT_SESSIONS_DIR,
+            ),
+            log_path=_pick(
+                os.environ.get(ENV_LOG, ""),
+                file_values.get("log"),
+                "",
+            )
+            or None,
         )
+
+
+def find_config_file() -> tuple[Path, bool] | None:
+    """Locate the YAML config file to load.
+
+    Returns ``(path, explicit)``. ``explicit`` is True when the path came
+    from ``AGENTSCOPE_ACP_CONFIG`` — a missing or unparseable file is then
+    a hard startup error. For search-path hits (False) the caller treats
+    problems as warnings only. ``None`` means no config file.
+    """
+    raw = os.environ.get(ENV_CONFIG, "").strip()
+    if raw:
+        return Path(raw).expanduser(), True
+    for candidate in (CONFIG_FILE_PROJECT, CONFIG_FILE_USER):
+        path = Path(candidate).expanduser()
+        if path.is_file():
+            return path, False
+    return None
+
+
+def load_config_file(path: Path, explicit: bool) -> dict[str, Any]:
+    """Parse a YAML config file into a flat mapping.
+
+    Failure handling: explicit files raise ``ValueError`` (aborts startup
+    with exit code 2), search-path files log a warning and return ``{}``
+    so the agent still starts on env/defaults.
+    """
+    try:
+        import yaml  # declared in pyproject; also a transitive dep of agentscope
+
+        # utf-8-sig tolerates the UTF-8 BOM Notepad adds on Windows.
+        with open(path, encoding="utf-8-sig") as fh:
+            raw = yaml.safe_load(fh)
+    except Exception as exc:
+        message = f"cannot load config file {path}: {exc}"
+        if explicit:
+            raise ValueError(message) from None
+        logger.warning("%s — ignoring", message)
+        return {}
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        message = f"config file {path} must contain a top-level mapping"
+        if explicit:
+            raise ValueError(message)
+        logger.warning("%s — ignoring", message)
+        return {}
+    return dict(raw)
+
+
+def _pick(env_value: str, file_value: Any, default: str) -> str:
+    """First non-empty of: env variable, config-file value, default."""
+    if env_value and env_value.strip():
+        return env_value.strip()
+    if file_value is not None and str(file_value).strip():
+        return str(file_value).strip()
+    return default
+
+
+def _as_csv(value: Any) -> str:
+    """Normalize a config value (list or string) to comma-separated text."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return ",".join(
+            str(item).strip() for item in value if str(item).strip()
+        )
+    return str(value).strip()
 
 
 def sessions_path(config: AcpConfig) -> Path:
@@ -384,11 +522,10 @@ def build_chat_model(config: AcpConfig, model: str | None = None):
     from agentscope.credential import OpenAICredential
     from agentscope.model import OpenAIChatModel
 
-    base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
     return OpenAIChatModel(
         credential=OpenAICredential(
             api_key=SecretStr(key),
-            base_url=base_url,
+            base_url=config.base_url,
         ),
         model=model_name,
     )
