@@ -654,9 +654,12 @@ def build_chat_model(config: AcpConfig, model: str | None = None):
     if context_size is not None:
         kwargs["context_size"] = context_size
     if max_tokens is not None:
-        kwargs["parameters"] = OpenAIChatModel.Parameters(
-            max_tokens=max_tokens,
-        )
+        # OpenAIChatModel maps parameters.max_tokens to the new-style
+        # ``max_completion_tokens`` request field, which third-party
+        # OpenAI-compatible endpoints (deepseek, dashscope, ...) ignore.
+        # extra_body forwards fields verbatim, so send the widely
+        # supported legacy ``max_tokens`` instead.
+        kwargs["extra_body"] = {"max_tokens": max_tokens}
     return OpenAIChatModel(
         credential=OpenAICredential(
             api_key=SecretStr(key),
