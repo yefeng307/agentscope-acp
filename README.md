@@ -34,7 +34,7 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | 会话持久化 | ✅ | AgentState → 本地 JSON；`session/load` 恢复（声明 load_session 能力） |
 | @文件引用 | ✅ | `resource_link` 块经 `fs/read_text_file` 拉取内容（按客户端 fs 能力门控）；`resource` 内嵌块直接纳入正文；解析失败跳过不阻断 |
 | 模型切换 | ✅ | `session/set_config_option` 运行时换模型（响应回传新配置） |
-| usage 统计 | ✅ | 每轮 `usage_update`（输入+输出 token） |
+| usage 统计 | ✅ | 每次模型调用 `usage_update_per_call`（input/output 计费明细，按 `messageId` 幂等 upsert）+ 每轮末尾累计 `usage_update`（used/size 上下文占用） |
 | `session/list` | ✅ | 列表（cwd 过滤） |
 | `session/close` | ✅ | 取消进行中 prompt + 删除磁盘状态 + 断开 MCP |
 | `session/resume` | ✅ | 重新挂接已存在会话（内存 → 磁盘 → 新建降级链） |

@@ -14,16 +14,19 @@ Mapping (see README Roadmap for the rest):
 - ``ToolCallEndEvent``        -> ``tool_call_update`` (args complete)
 - ``ToolResultEndEvent``      -> ``tool_call_update`` (completed/failed)
 - ``ReplyEndEvent``           -> turn-stop reason for ``PromptResponse``
-- ``ModelCallEndEvent``       -> token accounting (usage_update)
+- ``ModelCallEndEvent``       -> per-call usage (``usage_update_per_call``);
+  the turn's cumulative ``usage_update`` is sent by the agent afterwards
 - result deltas               -> buffered and flushed on the end event
 """
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal, Union, get_args
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from acp import start_tool_call, text_block, tool_content, update_tool_call
-from acp.schema import AgentMessageChunk, AgentThoughtChunk
+from acp.schema import AgentMessageChunk, AgentThoughtChunk, SessionNotification
 
 from agentscope.event import (
     ModelCallEndEvent,
@@ -96,6 +99,64 @@ def agent_thought_chunk(message_id: str, text: str) -> AgentThoughtChunk:
     )
 
 
+class UsageUpdatePerCall(BaseModel):
+    """Per-model-call token usage (``usage_update_per_call``).
+
+    Not part of the official ACP union: agentscope-acp extends the SDK's
+    ``SessionNotification.update`` union at import time so this update can
+    ride alongside the turn's cumulative ``usage_update``. Hosts upsert by
+    ``message_id`` for idempotency across reconnects/replays.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    # No default: the SDK serializes updates with exclude_defaults=True,
+    # which would silently drop the discriminator field (and the client
+    # would not be able to recognize the update type).
+    session_update: Literal["usage_update_per_call"] = Field(
+        alias="sessionUpdate",
+    )
+    # Unique per call within a turn (``{reply_id}:call{i}``); hosts key
+    # their usage rows on this id so replays overwrite instead of append.
+    message_id: str = Field(alias="messageId")
+    # Billing-grade values: the call's prompt tokens include the full
+    # context accumulated before the call (history + tool results).
+    input: int
+    output: int
+
+
+def usage_update_per_call(
+    message_id: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> UsageUpdatePerCall:
+    """Build one per-call usage update from a ``ModelCallEndEvent``."""
+    return UsageUpdatePerCall(
+        session_update="usage_update_per_call",
+        message_id=message_id,
+        input=input_tokens,
+        output=output_tokens,
+    )
+
+
+def _extend_session_update_union() -> None:
+    """Allow ``SessionNotification`` to carry ``UsageUpdatePerCall``.
+
+    The SDK models ``update`` as a discriminated union with a fixed member
+    list; pydantic rejects unknown ``sessionUpdate`` tags. Appending our
+    type to the union keeps everything else (serialization, aliasing)
+    untouched. Idempotent: safe if this module is imported repeatedly.
+    """
+    field = SessionNotification.model_fields["update"]
+    existing = get_args(field.annotation)
+    if UsageUpdatePerCall not in existing:
+        field.annotation = Union[(*existing, UsageUpdatePerCall)]
+        SessionNotification.model_rebuild(force=True)
+
+
+_extend_session_update_union()
+
+
 class TurnTranslator:
     """Stateful translator for one ``session/prompt`` turn.
 
@@ -108,6 +169,9 @@ class TurnTranslator:
     def __init__(self) -> None:
         self.input_tokens = 0
         self.output_tokens = 0
+        # Per-call sequence number inside the turn, for unique message ids
+        # (``{reply_id}:call{i}``) on the usage_update_per_call updates.
+        self._call_count = 0
         self.finished_reason: ReplyFinishedReason | None = None
         # Per-tool-call buffers keyed by tool_call_id. Tool args and output
         # stream in as deltas; both are flushed on their respective end
@@ -138,9 +202,19 @@ class TurnTranslator:
             return [agent_thought_chunk(message_id, event.delta)]
 
         if isinstance(event, ModelCallEndEvent):
+            # Cumulative accounting for the turn's usage_update (kept as
+            # is), plus one per-call update so hosts can bill each model
+            # call separately.
             self.input_tokens += event.input_tokens
             self.output_tokens += event.output_tokens
-            return []
+            self._call_count += 1
+            return [
+                usage_update_per_call(
+                    message_id=f"{event.reply_id}:call{self._call_count}",
+                    input_tokens=event.input_tokens,
+                    output_tokens=event.output_tokens,
+                ),
+            ]
 
         if isinstance(event, ReplyEndEvent):
             self.finished_reason = event.finished_reason

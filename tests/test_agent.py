@@ -276,8 +276,9 @@ async def test_prompt_streams_chunks_and_ends_turn():
 
     assert response.stop_reason == "end_turn"
     conn = acp_agent._conn
-    # 2 text chunks + 1 usage update at the end of the turn.
-    assert len(conn.updates) == 3
+    # 2 text chunks + 1 per-call usage update + 1 cumulative usage
+    # update at the end of the turn.
+    assert len(conn.updates) == 4
     ids = {u.message_id for _, u in conn.updates if u.session_update == "agent_message_chunk"}
     assert ids == {"r1:b1"}
     texts = "".join(
@@ -286,7 +287,16 @@ async def test_prompt_streams_chunks_and_ends_turn():
         if u.session_update == "agent_message_chunk"
     )
     assert texts == "Hello"
-    # Usage was reported from the ModelCallEndEvent.
+    # Per-call usage was reported from the ModelCallEndEvent.
+    per_call = [
+        u for _, u in conn.updates
+        if u.session_update == "usage_update_per_call"
+    ]
+    assert len(per_call) == 1
+    assert per_call[0].message_id == "r1:call1"
+    assert per_call[0].input == 10
+    assert per_call[0].output == 5
+    # Cumulative usage was reported at the end of the turn.
     usage = conn.updates[-1][1]
     assert usage.session_update == "usage_update"
     assert usage.used == 15

@@ -91,6 +91,23 @@ class TestTurnTranslator:
         assert translator.input_tokens == 15
         assert translator.output_tokens == 27
 
+    def test_per_call_usage_update_shape(self):
+        translator = TurnTranslator()
+        update = translator.process(_model_call_end("r1", 10, 20))[0]
+        data = update.model_dump(exclude_none=True, by_alias=True)
+        assert data["sessionUpdate"] == "usage_update_per_call"
+        assert data["messageId"] == "r1:call1"
+        assert data["input"] == 10
+        assert data["output"] == 20
+        assert "size" not in data
+
+    def test_per_call_usage_message_ids_are_unique_per_turn(self):
+        translator = TurnTranslator()
+        first = translator.process(_model_call_end("r1", 10, 20))[0]
+        second = translator.process(_model_call_end("r1", 5, 7))[0]
+        assert first.message_id == "r1:call1"
+        assert second.message_id == "r1:call2"
+
     def test_stop_reason_mapping(self):
         translator = TurnTranslator()
         assert translator.stop_reason() == STOP_END_TURN
