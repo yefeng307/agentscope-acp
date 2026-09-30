@@ -195,3 +195,66 @@ def test_resolve_context_size_prefers_per_model(monkeypatch):
     config = AcpConfig.from_env()
     assert config.resolve_context_size("m-a") == 1000
     assert config.resolve_context_size("other") == 64000
+
+
+# ── max output tokens ──────────────────────────────────────────────────────
+
+
+def test_max_tokens_default_from_env(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS", "8192")
+    config = AcpConfig.from_env()
+    assert config.resolve_max_tokens("any-model") == 8192
+
+
+def test_max_tokens_per_model_from_env(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL", "m-a:1000, m-b:2000")
+    config = AcpConfig.from_env()
+    assert config.resolve_max_tokens("m-a") == 1000
+    assert config.resolve_max_tokens("m-b") == 2000
+    assert config.resolve_max_tokens("other") is None
+
+
+def test_max_tokens_from_file(tmp_path, monkeypatch):
+    path = _write(
+        tmp_path,
+        "max_tokens: 4096\n"
+        "max_tokens_by_model:\n"
+        "  m-a: 1000\n"
+        "  m-b: 2000\n",
+    )
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONFIG", str(path))
+    config = AcpConfig.from_env()
+    assert config.resolve_max_tokens("m-a") == 1000
+    assert config.resolve_max_tokens("m-b") == 2000
+    assert config.resolve_max_tokens("other") == 4096
+
+
+def test_max_tokens_env_overrides_file(tmp_path, monkeypatch):
+    path = _write(tmp_path, "max_tokens: 4096\n")
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONFIG", str(path))
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS", "2048")
+    assert AcpConfig.from_env().default_max_tokens == 2048
+
+
+def test_max_tokens_unset_is_none(monkeypatch):
+    monkeypatch.delenv("AGENTSCOPE_ACP_MAX_TOKENS", raising=False)
+    monkeypatch.delenv("AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL", raising=False)
+    config = AcpConfig.from_env()
+    assert config.default_max_tokens is None
+    assert config.max_tokens_by_model == {}
+
+
+def test_max_tokens_bad_value_ignored(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS", "abc")
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL", "m-a:8k")
+    config = AcpConfig.from_env()
+    assert config.default_max_tokens is None
+    assert config.max_tokens_by_model == {}
+
+
+def test_resolve_max_tokens_prefers_per_model(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS", "8192")
+    monkeypatch.setenv("AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL", "m-a:1000")
+    config = AcpConfig.from_env()
+    assert config.resolve_max_tokens("m-a") == 1000
+    assert config.resolve_max_tokens("other") == 8192

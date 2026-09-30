@@ -57,6 +57,8 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `AGENTSCOPE_ACP_CONFIG` | 否 | 见下 | 显式指定 YAML 配置文件路径（支持 `~`；缺失/格式错误则启动失败） |
 | `AGENTSCOPE_ACP_CONTEXT_SIZE` | 否 | 引擎默认 128000 | 模型上下文窗口大小（token）：决定引擎记忆压缩触发阈值（默认 `0.8 × 该值`）与 `usage_update` 的 `size` 字段；建议按模型真实窗口配置 |
 | `AGENTSCOPE_ACP_CONTEXT_SIZES` | 否 | — | 按模型的上下文窗口映射，`模型名:大小` 逗号分隔，如 `m-a:128000,m-b:256000`（优先于 CONTEXT_SIZE） |
+| `AGENTSCOPE_ACP_MAX_TOKENS` | 否 | 服务端默认 | 单次回复最大输出 token 数（`max_tokens`） |
+| `AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL` | 否 | — | 按模型的输出上限映射，`模型名:大小` 逗号分隔（优先于 MAX_TOKENS） |
 
 ## 配置文件（可选）
 
@@ -83,6 +85,9 @@ context_size: 128000                           # 上下文窗口默认值（toke
 context_sizes:                                 # 按模型的窗口大小（优先于 context_size）
   deepseek-v4-flash: 128000
   deepseek-v4-pro: 256000
+max_tokens: 8192                               # 单次回复输出上限（不配则服务端默认）
+max_tokens_by_model:                           # 按模型的输出上限（优先于 max_tokens）
+  deepseek-v4-pro: 16384
 system_prompt: |
   你是一个严谨的编程助手。
   用中文回复，代码风格保持项目一致。
@@ -105,6 +110,8 @@ log: ~/.agentscope-acp/agent.log
 | `api_key` | `OPENAI_API_KEY` | API key（建议走环境变量） |
 | `context_size` | `AGENTSCOPE_ACP_CONTEXT_SIZE` | 上下文窗口默认大小（token），也是引擎记忆压缩阈值基准（`0.8 × 该值` 触发压缩） |
 | `context_sizes` | `AGENTSCOPE_ACP_CONTEXT_SIZES` | 按模型映射的窗口大小，键为模型名 |
+| `max_tokens` | `AGENTSCOPE_ACP_MAX_TOKENS` | 单次回复最大输出 token 数 |
+| `max_tokens_by_model` | `AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL` | 按模型映射的输出上限，键为模型名 |
 | `tools` | `AGENTSCOPE_ACP_TOOLS` | 是否启用工具集 |
 | `tool_names` | `AGENTSCOPE_ACP_TOOL_NAMES` | 工具白名单 |
 | `skills_dir` | `AGENTSCOPE_ACP_SKILLS_DIR` | Skills 目录 |

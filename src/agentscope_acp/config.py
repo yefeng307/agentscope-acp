@@ -36,6 +36,8 @@ ENV_LOG = "AGENTSCOPE_ACP_LOG"
 ENV_CONFIG = "AGENTSCOPE_ACP_CONFIG"
 ENV_CONTEXT_SIZE = "AGENTSCOPE_ACP_CONTEXT_SIZE"
 ENV_CONTEXT_SIZES = "AGENTSCOPE_ACP_CONTEXT_SIZES"
+ENV_MAX_TOKENS = "AGENTSCOPE_ACP_MAX_TOKENS"
+ENV_MAX_TOKENS_BY_MODEL = "AGENTSCOPE_ACP_MAX_TOKENS_BY_MODEL"
 
 # Config-file search order (first existing file wins; only ONE file is
 # loaded). AGENTSCOPE_ACP_CONFIG points at an explicit file: a missing or
@@ -88,6 +90,11 @@ class AcpConfig:
     # default (OpenAIChatModel's 128000) is reported.
     default_context_size: int | None = None
     context_sizes: dict[str, int] = field(default_factory=dict)
+    # Max output tokens for a single reply (engine Parameters.max_tokens):
+    # per-model entries win over the default; unset means the model's
+    # server-side default applies.
+    default_max_tokens: int | None = None
+    max_tokens_by_model: dict[str, int] = field(default_factory=dict)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
     tool_names: list[str] | None = None
@@ -136,7 +143,10 @@ class AcpConfig:
                 if parsed is not None:
                     context_sizes[str(mid)] = parsed
         context_sizes.update(
-            _parse_context_sizes(os.environ.get(ENV_CONTEXT_SIZES, "")),
+            _parse_model_sizes(
+                os.environ.get(ENV_CONTEXT_SIZES, ""),
+                ENV_CONTEXT_SIZES,
+            ),
         )
         default_context_size = _parse_int(
             os.environ.get(ENV_CONTEXT_SIZE, ""),
@@ -146,6 +156,30 @@ class AcpConfig:
             default_context_size = _parse_int(
                 file_values.get("context_size"),
                 "context_size",
+            )
+
+        # max output tokens: same layering as context sizes above.
+        max_tokens_by_model: dict[str, int] = {}
+        file_map = file_values.get("max_tokens_by_model")
+        if isinstance(file_map, dict):
+            for mid, size in file_map.items():
+                parsed = _parse_int(size, "max_tokens_by_model")
+                if parsed is not None:
+                    max_tokens_by_model[str(mid)] = parsed
+        max_tokens_by_model.update(
+            _parse_model_sizes(
+                os.environ.get(ENV_MAX_TOKENS_BY_MODEL, ""),
+                ENV_MAX_TOKENS_BY_MODEL,
+            ),
+        )
+        default_max_tokens = _parse_int(
+            os.environ.get(ENV_MAX_TOKENS, ""),
+            ENV_MAX_TOKENS,
+        )
+        if default_max_tokens is None:
+            default_max_tokens = _parse_int(
+                file_values.get("max_tokens"),
+                "max_tokens",
             )
 
         raw_list = _pick(
@@ -195,6 +229,8 @@ class AcpConfig:
             available_models=entries,
             default_context_size=default_context_size,
             context_sizes=context_sizes,
+            default_max_tokens=default_max_tokens,
+            max_tokens_by_model=max_tokens_by_model,
             system_prompt=_pick(
                 os.environ.get(ENV_SYSTEM_PROMPT, ""),
                 file_values.get("system_prompt"),
@@ -246,6 +282,17 @@ class AcpConfig:
         if model_id in self.context_sizes:
             return self.context_sizes[model_id]
         return self.default_context_size
+
+    def resolve_max_tokens(self, model: str | None = None) -> int | None:
+        """Max output tokens for ``model`` (default: ``self.model``).
+
+        Per-model entries win over the default; ``None`` when nothing is
+        configured (the model's server-side default applies).
+        """
+        model_id = model or self.model
+        if model_id in self.max_tokens_by_model:
+            return self.max_tokens_by_model[model_id]
+        return self.default_max_tokens
 
 
 def find_config_file() -> tuple[Path, bool] | None:
@@ -330,7 +377,7 @@ def _parse_int(raw: Any, source: str) -> int | None:
         return None
 
 
-def _parse_context_sizes(raw: str) -> dict[str, int]:
+def _parse_model_sizes(raw: str, env_name: str) -> dict[str, int]:
     """Parse ``model:size`` pairs, e.g. ``m-a:128000,m-b:256000``."""
     result: dict[str, int] = {}
     for part in raw.split(","):
@@ -340,12 +387,12 @@ def _parse_context_sizes(raw: str) -> dict[str, int]:
         if ":" not in part:
             logger.warning(
                 "invalid %s entry %r — skipping",
-                ENV_CONTEXT_SIZES,
+                env_name,
                 part,
             )
             continue
         model_id, _, size_raw = part.partition(":")
-        size = _parse_int(size_raw, ENV_CONTEXT_SIZES)
+        size = _parse_int(size_raw, env_name)
         if size is not None:
             result[model_id.strip()] = size
     return result
@@ -602,9 +649,14 @@ def build_chat_model(config: AcpConfig, model: str | None = None):
 
     base_url = config.base_url
     context_size = config.resolve_context_size(model_name)
+    max_tokens = config.resolve_max_tokens(model_name)
     kwargs: dict[str, Any] = {}
     if context_size is not None:
         kwargs["context_size"] = context_size
+    if max_tokens is not None:
+        kwargs["parameters"] = OpenAIChatModel.Parameters(
+            max_tokens=max_tokens,
+        )
     return OpenAIChatModel(
         credential=OpenAICredential(
             api_key=SecretStr(key),
