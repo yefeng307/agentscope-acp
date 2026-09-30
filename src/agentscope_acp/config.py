@@ -34,6 +34,8 @@ ENV_PERMISSION_MODE = "AGENTSCOPE_ACP_PERMISSION_MODE"
 ENV_SESSIONS_DIR = "AGENTSCOPE_ACP_SESSIONS_DIR"
 ENV_LOG = "AGENTSCOPE_ACP_LOG"
 ENV_CONFIG = "AGENTSCOPE_ACP_CONFIG"
+ENV_CONTEXT_SIZE = "AGENTSCOPE_ACP_CONTEXT_SIZE"
+ENV_CONTEXT_SIZES = "AGENTSCOPE_ACP_CONTEXT_SIZES"
 
 # Config-file search order (first existing file wins; only ONE file is
 # loaded). AGENTSCOPE_ACP_CONFIG points at an explicit file: a missing or
@@ -81,6 +83,11 @@ class AcpConfig:
     model: str
     base_url: str | None = None
     available_models: list[ModelEntry] = field(default_factory=list)
+    # Model context-window sizes (tokens) for the usage_update ``size``
+    # field: per-model entries win over the default; unset means the engine
+    # default (OpenAIChatModel's 128000) is reported.
+    default_context_size: int | None = None
+    context_sizes: dict[str, int] = field(default_factory=dict)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     enable_tools: bool = True
     tool_names: list[str] | None = None
@@ -118,6 +125,28 @@ class AcpConfig:
             file_values.get("model"),
             DEFAULT_MODEL,
         )
+
+        # context window sizes: per-model map first, then the single
+        # default; env values override the config file in each layer.
+        context_sizes: dict[str, int] = {}
+        file_map = file_values.get("context_sizes")
+        if isinstance(file_map, dict):
+            for mid, size in file_map.items():
+                parsed = _parse_int(size, "context_sizes")
+                if parsed is not None:
+                    context_sizes[str(mid)] = parsed
+        context_sizes.update(
+            _parse_context_sizes(os.environ.get(ENV_CONTEXT_SIZES, "")),
+        )
+        default_context_size = _parse_int(
+            os.environ.get(ENV_CONTEXT_SIZE, ""),
+            ENV_CONTEXT_SIZE,
+        )
+        if default_context_size is None:
+            default_context_size = _parse_int(
+                file_values.get("context_size"),
+                "context_size",
+            )
 
         raw_list = _pick(
             os.environ.get(ENV_AVAILABLE_MODELS, ""),
@@ -164,6 +193,8 @@ class AcpConfig:
             base_url=base_url,
             model=model,
             available_models=entries,
+            default_context_size=default_context_size,
+            context_sizes=context_sizes,
             system_prompt=_pick(
                 os.environ.get(ENV_SYSTEM_PROMPT, ""),
                 file_values.get("system_prompt"),
@@ -203,6 +234,18 @@ class AcpConfig:
             )
             or None,
         )
+
+
+    def resolve_context_size(self, model: str | None = None) -> int | None:
+        """Context window size for ``model`` (default: ``self.model``).
+
+        Per-model entries win over the default; ``None`` when nothing is
+        configured (``build_chat_model`` then keeps the engine default).
+        """
+        model_id = model or self.model
+        if model_id in self.context_sizes:
+            return self.context_sizes[model_id]
+        return self.default_context_size
 
 
 def find_config_file() -> tuple[Path, bool] | None:
@@ -271,6 +314,41 @@ def _as_csv(value: Any) -> str:
             str(item).strip() for item in value if str(item).strip()
         )
     return str(value).strip()
+
+
+def _parse_int(raw: Any, source: str) -> int | None:
+    """Tolerant int parsing; empty/invalid values warn and yield ``None``."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        logger.warning("invalid %s value %r — ignoring", source, raw)
+        return None
+
+
+def _parse_context_sizes(raw: str) -> dict[str, int]:
+    """Parse ``model:size`` pairs, e.g. ``m-a:128000,m-b:256000``."""
+    result: dict[str, int] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            logger.warning(
+                "invalid %s entry %r — skipping",
+                ENV_CONTEXT_SIZES,
+                part,
+            )
+            continue
+        model_id, _, size_raw = part.partition(":")
+        size = _parse_int(size_raw, ENV_CONTEXT_SIZES)
+        if size is not None:
+            result[model_id.strip()] = size
+    return result
 
 
 def sessions_path(config: AcpConfig) -> Path:
@@ -522,10 +600,16 @@ def build_chat_model(config: AcpConfig, model: str | None = None):
     from agentscope.credential import OpenAICredential
     from agentscope.model import OpenAIChatModel
 
+    base_url = config.base_url
+    context_size = config.resolve_context_size(model_name)
+    kwargs: dict[str, Any] = {}
+    if context_size is not None:
+        kwargs["context_size"] = context_size
     return OpenAIChatModel(
         credential=OpenAICredential(
             api_key=SecretStr(key),
-            base_url=config.base_url,
+            base_url=base_url,
         ),
         model=model_name,
+        **kwargs,
     )

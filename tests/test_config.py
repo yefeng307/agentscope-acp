@@ -132,3 +132,66 @@ def test_search_path_bad_yaml_warns(tmp_path):
     _write(tmp_path, "{ not: [valid yaml\n", name="agentscope-acp.yaml")
     config = AcpConfig.from_env()
     assert config.system_prompt == DEFAULT_SYSTEM_PROMPT
+
+
+# ── context window sizes ────────────────────────────────────────────────────
+
+
+def test_context_size_default_from_env(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZE", "64000")
+    config = AcpConfig.from_env()
+    assert config.resolve_context_size("any-model") == 64000
+
+
+def test_context_sizes_per_model_from_env(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZES", "m-a:1000, m-b:2000")
+    config = AcpConfig.from_env()
+    assert config.resolve_context_size("m-a") == 1000
+    assert config.resolve_context_size("m-b") == 2000
+    assert config.resolve_context_size("other") is None
+
+
+def test_context_size_from_file(tmp_path, monkeypatch):
+    path = _write(
+        tmp_path,
+        "context_size: 96000\n"
+        "context_sizes:\n"
+        "  m-a: 1000\n"
+        "  m-b: 2000\n",
+    )
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONFIG", str(path))
+    config = AcpConfig.from_env()
+    assert config.resolve_context_size("m-a") == 1000
+    assert config.resolve_context_size("m-b") == 2000
+    assert config.resolve_context_size("other") == 96000
+
+
+def test_context_size_env_overrides_file(tmp_path, monkeypatch):
+    path = _write(tmp_path, "context_size: 96000\n")
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONFIG", str(path))
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZE", "48000")
+    assert AcpConfig.from_env().default_context_size == 48000
+
+
+def test_context_size_unset_is_none(monkeypatch):
+    monkeypatch.delenv("AGENTSCOPE_ACP_CONTEXT_SIZE", raising=False)
+    monkeypatch.delenv("AGENTSCOPE_ACP_CONTEXT_SIZES", raising=False)
+    config = AcpConfig.from_env()
+    assert config.default_context_size is None
+    assert config.context_sizes == {}
+
+
+def test_context_size_bad_value_ignored(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZE", "abc")
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZES", "m-a:12k")
+    config = AcpConfig.from_env()
+    assert config.default_context_size is None
+    assert config.context_sizes == {}
+
+
+def test_resolve_context_size_prefers_per_model(monkeypatch):
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZE", "64000")
+    monkeypatch.setenv("AGENTSCOPE_ACP_CONTEXT_SIZES", "m-a:1000")
+    config = AcpConfig.from_env()
+    assert config.resolve_context_size("m-a") == 1000
+    assert config.resolve_context_size("other") == 64000
