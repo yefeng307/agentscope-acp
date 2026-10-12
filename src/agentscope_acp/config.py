@@ -414,6 +414,140 @@ def _parse_bool(raw: str, default: bool) -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
+def _iter_skill_dirs(root: str) -> list[str]:
+    """Return directories containing a ``SKILL.md`` under ``root``.
+
+    The engine's ``LocalSkillLoader(scan_subdir=True)`` discovers skills
+    with ``os.walk``, which does not follow symlinks — so skills that
+    agent-work enables by symlinking into the skills directory would be
+    invisible. Recursing with ``os.path.isdir`` (which follows symlinks)
+    finds them, and ``realpath`` dedup guards against symlink cycles.
+    A directory that itself contains ``SKILL.md`` is a skill root and is
+    not descended further.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def visit(directory: str) -> None:
+        real = os.path.realpath(directory)
+        if real in seen:
+            return
+        seen.add(real)
+        if os.path.isfile(os.path.join(directory, "SKILL.md")):
+            found.append(directory)
+            return
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return
+        for name in names:
+            child = os.path.join(directory, name)
+            if os.path.isdir(child):  # follows symlinks
+                visit(child)
+
+    visit(root)
+    return found
+
+
+def _build_skill_loader(skills_dir: str):
+    """Build one skill loader that reads skills under ``skills_dir``.
+
+    A single custom ``SkillLoaderBase`` replaces registering one engine
+    ``LocalSkillLoader`` per skill root: ``_iter_skill_dirs`` finds the
+    roots (symlink-aware), and each ``SKILL.md`` is read and parsed here
+    with an mtime cache — so the engine sees exactly one loader, and its
+    serial per-loader await inside ``ToolGroup.list_skills`` disappears.
+
+    ``Skill`` is still the engine's type (the injection machinery and the
+    built-in ``skill_viewer`` tool consume it); only the file reading is
+    local. Imports are deferred like the rest of this module.
+    """
+    import asyncio
+
+    import yaml
+
+    from agentscope.skill import Skill, SkillLoaderBase
+
+    def _parse_frontmatter(text: str) -> tuple[dict, str]:
+        """Split the ``---`` YAML frontmatter from the markdown body.
+
+        Returns ``({}, text)`` when there is no frontmatter; tolerates a
+        leading BOM and CRLF line endings.
+        """
+        text = text.lstrip("\ufeff")
+        if not text.startswith("---"):
+            return {}, text
+        rest = text[3:]
+        end = rest.find("\n---")
+        if end == -1:
+            return {}, text
+        raw = rest[:end].replace("\r\n", "\n")
+        body = rest[end + 4:].lstrip()
+        meta = yaml.safe_load(raw)
+        return (meta if isinstance(meta, dict) else {}), body
+
+    class _SkillLoader(SkillLoaderBase):
+        def __init__(self) -> None:
+            # Keyed by the registered skill root (the symlink path, when
+            # agent-work linked it in): ``Skill.dir`` must keep the link,
+            # so a disabled skill (link removed) also disappears from
+            # skill_viewer lookups.
+            self._cache: dict[str, Skill] = {}
+
+        def _read(self, skill_root: str) -> Skill | None:
+            """Load one SKILL.md (sync; runs in a worker thread)."""
+            path = os.path.join(skill_root, "SKILL.md")
+            try:
+                updated_at = os.path.getmtime(path)
+                cached = self._cache.get(skill_root)
+                if cached is not None and cached.updated_at == updated_at:
+                    return cached
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError as exc:
+                logger.warning(
+                    "Failed to load skill from %s: %s",
+                    skill_root,
+                    exc,
+                )
+                return None
+            meta, body = _parse_frontmatter(text)
+            name = meta.get("name")
+            description = meta.get("description")
+            if not name or not description:
+                logger.warning(
+                    "SKILL.md in %s is missing required fields "
+                    "(name or description). Skipping.",
+                    skill_root,
+                )
+                return None
+            skill = Skill(
+                name=str(name),
+                description=str(description),
+                dir=skill_root,
+                markdown=body,
+                updated_at=updated_at,
+            )
+            self._cache[skill_root] = skill
+            return skill
+
+        async def list_skills(self) -> list[Skill]:
+            roots = await asyncio.to_thread(_iter_skill_dirs, skills_dir)
+            results = await asyncio.gather(
+                *(asyncio.to_thread(self._read, root) for root in roots),
+                return_exceptions=True,
+            )
+            skills: list[Skill] = []
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("failed to load a skill: %s", result)
+                elif result is not None:
+                    skills.append(result)
+            return skills
+
+    return _SkillLoader()
+
+
 def build_toolkit(
     enable_tools: bool,
     skills_dir: str | None = None,
@@ -443,7 +577,6 @@ def build_toolkit(
     """
     if not enable_tools:
         return None
-    from agentscope.skill import LocalSkillLoader
     from agentscope.tool import (
         Bash,
         Edit,
@@ -483,12 +616,17 @@ def build_toolkit(
     skills_or_loaders = None
     if skills_dir:
         if os.path.isdir(skills_dir):
-            # scan_subdir=True accepts both layouts: the directory being
-            # one skill itself, or containing multiple skill subdirectories
-            # (the standard Agent Skills ecosystem layout).
-            skills_or_loaders = [
-                LocalSkillLoader(directory=skills_dir, scan_subdir=True),
-            ]
+            # One custom loader reads the whole skills dir: symlink-aware
+            # scan (_iter_skill_dirs) plus a local SKILL.md read with an
+            # mtime cache. The engine's LocalSkillLoader(scan_subdir=True)
+            # walks with os.walk, which skips symlinked skills (agent-work
+            # enables skills by symlinking them in), loading nothing.
+            if not _iter_skill_dirs(skills_dir):
+                logger.warning(
+                    "no SKILL.md found under skills dir %s",
+                    skills_dir,
+                )
+            skills_or_loaders = [_build_skill_loader(skills_dir)]
         else:
             logger.warning(
                 "skills dir %r does not exist — ignoring %s",

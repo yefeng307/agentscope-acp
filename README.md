@@ -133,7 +133,8 @@ skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
     └── SKILL.md
 ```
 
-AgentScope 的 `LocalSkillLoader` 扫描每个 `SKILL.md`，把 `name`/`description`
+递归扫描 `skills/`：每个含 `SKILL.md` 的目录注册为一个技能——嵌套布局与
+软链条目（agent-work 的技能分发机制）均可被发现；`name`/`description`
 注入系统提示词（渐进式披露：全文本体按需通过内置 `skill_viewer` 工具读取）。
 目录不存在时仅记录警告、按无 skill 启动，不会崩溃。
 

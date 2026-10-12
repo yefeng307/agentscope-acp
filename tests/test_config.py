@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
 """Unit tests for config.from_env — env parsing edge cases (no network)."""
+import os
+import subprocess
+
 import pytest
 
-from agentscope_acp.config import DEFAULT_SYSTEM_PROMPT, AcpConfig
+from agentscope_acp.config import (
+    DEFAULT_SYSTEM_PROMPT,
+    AcpConfig,
+    _iter_skill_dirs,
+    build_toolkit,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -35,6 +43,178 @@ def test_skills_dir_expands_tilde(monkeypatch):
 def test_skills_dir_unset_is_none(monkeypatch):
     monkeypatch.delenv("AGENTSCOPE_ACP_SKILLS_DIR", raising=False)
     assert AcpConfig.from_env().skills_dir is None
+
+
+class TestIterSkillDirs:
+    def _skill(self, root, rel, name):
+        d = root / rel
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {name}\n---\n# {name}",
+            encoding="utf-8",
+        )
+
+    def test_finds_nested_skill_roots(self, tmp_path):
+        self._skill(tmp_path, "skill-a", "a")
+        self._skill(tmp_path, "group/skill-b", "b")
+        (tmp_path / "empty-dir").mkdir()
+        roots = _iter_skill_dirs(str(tmp_path))
+        assert sorted(roots) == [
+            str(tmp_path / "group" / "skill-b"),
+            str(tmp_path / "skill-a"),
+        ]
+
+    def test_skill_root_not_descended(self, tmp_path):
+        # A skill dir with a nested SKILL.md inside: the outer root wins
+        # and is not descended further (no duplicate registration).
+        self._skill(tmp_path, "outer", "outer")
+        self._skill(tmp_path, "outer/inner", "inner")
+        assert _iter_skill_dirs(str(tmp_path)) == [str(tmp_path / "outer")]
+
+    def test_entries_without_skill_md_ignored(self, tmp_path):
+        # Plain files and dirs without a SKILL.md register nothing.
+        (tmp_path / "note.txt").write_text("hi", encoding="utf-8")
+        (tmp_path / "empty-dir").mkdir()
+        self._skill(tmp_path, "skill-a", "a")
+        assert _iter_skill_dirs(str(tmp_path)) == [str(tmp_path / "skill-a")]
+
+    @staticmethod
+    def _make_dir_link(target, link):
+        """Link ``link`` → ``target`` (both path-like).
+
+        Prefers ``os.symlink``; on Windows without the symlink privilege
+        (developer mode / admin) falls back to a junction (``mklink /J``),
+        which needs no privilege and is followed by ``os.path.isfile``
+        just the same. Returns True on success.
+        """
+        try:
+            os.symlink(str(target), str(link), target_is_directory=True)
+            return True
+        except OSError:
+            pass
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                    check=True,
+                    capture_output=True,
+                )
+                return True
+            except (OSError, subprocess.CalledProcessError):
+                return False
+        return False
+
+    def test_follows_symlinked_skill(self, tmp_path, tmp_path_factory):
+        # The point of the symlink-aware walk: agent-work enables a skill
+        # by symlinking it into the skills dir, and the engine's
+        # os.walk-based scan would miss it. The target lives outside the
+        # skills tree (as in production), so cycle protection cannot
+        # dedupe it away.
+        target = tmp_path_factory.mktemp("real-skill")
+        (target / "SKILL.md").write_text(
+            "---\nname: linked\ndescription: linked\n---\n# linked",
+            encoding="utf-8",
+        )
+        link = tmp_path / "linked-skill"
+        if not self._make_dir_link(target, link):
+            pytest.skip("symlink/junction unsupported on this platform")
+        assert _iter_skill_dirs(str(tmp_path)) == [str(link)]
+
+    def test_symlink_cycle_terminates(self, tmp_path):
+        # A symlink pointing back at the skills dir itself (or any
+        # ancestor) must not loop: realpath dedup stops the walk.
+        self._skill(tmp_path, "skill-a", "a")
+        loop = tmp_path / "loop"
+        if not self._make_dir_link(tmp_path, loop):
+            pytest.skip("symlink/junction unsupported on this platform")
+        assert _iter_skill_dirs(str(tmp_path)) == [str(tmp_path / "skill-a")]
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _iter_skill_dirs(str(tmp_path / "nope")) == []
+
+
+class TestBuildToolkitSkills:
+    async def test_single_loader_loads_all_skills(self, tmp_path):
+        for rel, name in [("a", "a"), ("group/b", "b")]:
+            d = tmp_path / rel
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {name}\n---\n# {name}",
+                encoding="utf-8",
+            )
+        toolkit = build_toolkit(
+            enable_tools=False,
+            skills_dir=str(tmp_path),
+        )
+        # enable_tools=False short-circuits before skills are consulted.
+        assert toolkit is None
+
+        toolkit = build_toolkit(
+            enable_tools=True,
+            skills_dir=str(tmp_path),
+            tool_names=["Bash"],
+        )
+        loaders = toolkit.tool_groups[0].skills_or_loaders
+        # Exactly one custom loader handles the whole skills dir.
+        assert len(loaders) == 1
+        skills = await loaders[0].list_skills()
+        assert {s.name for s in skills} == {"a", "b"}
+        assert {s.markdown for s in skills} == {"# a", "# b"}
+        # Nested and flat roots are both found; the mtime cache returns
+        # equal skills on the second call.
+        assert await loaders[0].list_skills() == skills
+
+    async def test_loader_follows_symlinked_skill(
+        self, tmp_path, tmp_path_factory
+    ):
+        # End to end: a symlinked skill (target outside the tree, as in
+        # production) is found and read; Skill.dir keeps the link path so
+        # disabling the skill (link removed) also hides its content.
+        target = tmp_path_factory.mktemp("real-skill")
+        (target / "SKILL.md").write_text(
+            "---\nname: linked\ndescription: linked\n---\n# linked",
+            encoding="utf-8",
+        )
+        link = tmp_path / "linked-skill"
+        if not TestIterSkillDirs._make_dir_link(target, link):
+            pytest.skip("symlink/junction unsupported on this platform")
+        toolkit = build_toolkit(
+            enable_tools=True,
+            skills_dir=str(tmp_path),
+            tool_names=["Bash"],
+        )
+        skills = await toolkit.tool_groups[0].skills_or_loaders[0].list_skills()
+        assert [s.name for s in skills] == ["linked"]
+        assert skills[0].dir == str(link)
+
+    async def test_loader_tolerates_crlf_and_bom(self, tmp_path):
+        d = tmp_path / "crlf-skill"
+        d.mkdir()
+        (d / "SKILL.md").write_bytes(
+            b"\xef\xbb\xbf---\r\n"
+            b"name: crlf\r\ndescription: crlf\r\n"
+            b"---\r\n# body"
+        )
+        toolkit = build_toolkit(
+            enable_tools=True,
+            skills_dir=str(tmp_path),
+            tool_names=["Bash"],
+        )
+        skills = await toolkit.tool_groups[0].skills_or_loaders[0].list_skills()
+        assert len(skills) == 1
+        assert skills[0].name == "crlf"
+        assert skills[0].markdown == "# body"
+
+    async def test_skills_dir_without_skill_md(self, tmp_path):
+        (tmp_path / "empty").mkdir()
+        toolkit = build_toolkit(
+            enable_tools=True,
+            skills_dir=str(tmp_path),
+            tool_names=["Bash"],
+        )
+        loaders = toolkit.tool_groups[0].skills_or_loaders
+        assert len(loaders) == 1
+        assert await loaders[0].list_skills() == []
 
 
 def test_available_models_include_current(monkeypatch):
