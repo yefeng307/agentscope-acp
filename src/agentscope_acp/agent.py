@@ -56,13 +56,14 @@ from acp.schema import (
 )
 
 from agentscope.agent import Agent as AgentScopeAgent
+from agentscope.agent import ContextConfig
 from agentscope.event import (
     ConfirmResult,
     RequireUserConfirmEvent,
     UserConfirmResultEvent,
     UserInterruptEvent,
 )
-from agentscope.message import UserMsg
+from agentscope.message import HintBlock, UserMsg
 from agentscope.permission import PermissionBehavior, PermissionRule
 from agentscope.state import AgentState
 
@@ -90,6 +91,14 @@ AGENT_TITLE = "AgentScope"
 USER_NAME = "user"
 
 CONFIG_OPTION_MODEL = "model"
+
+# Context-compression extension ("_compress" wire method). AgentScope 2.0.5
+# has no force flag, so a near-zero trigger ratio is injected per call to
+# make the engine's ratio check always pass.
+COMPRESS_METHOD = "compress"
+COMPRESS_TRIGGER_RATIO = 0.01
+COMPRESS_DEFAULT_RESERVE_TOKENS = 640
+COMPRESS_OVERFLOW_MARGIN = 4096
 
 # Permission options offered for each tool call. ``option_id`` values are
 # mapped back onto ConfirmResult in ``_confirm_result``.
@@ -283,6 +292,7 @@ class AgentScopeAcpAgent(Agent):
         self._agent_factory = agent_factory or self._default_agent_factory
         self._records: dict[str, SessionRecord] = {}
         self._prompt_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._compress_locks: dict[str, asyncio.Lock] = {}
         self._client_capabilities: Any | None = None
 
     def on_connect(self, conn: Client) -> None:
@@ -573,6 +583,13 @@ class AgentScopeAcpAgent(Agent):
                 {"details": f"Unknown session: {session_id!r}"},
             )
 
+        # Wait out an in-flight compression: it replaces state.context at
+        # the end, and a prompt racing it would lose its user message.
+        compress_lock = self._compress_locks.get(session_id)
+        if compress_lock is not None and compress_lock.locked():
+            await compress_lock.acquire()
+            compress_lock.release()
+
         text = await self._resolve_prompt_text(session_id, prompt)
         if not text:
             return PromptResponse(stop_reason="end_turn")
@@ -800,6 +817,206 @@ class AgentScopeAcpAgent(Agent):
         # itself carries the new options and ACP is a single-client link
         # (QwenPaw likewise relies on the response only).
         return SetSessionConfigOptionResponse(config_options=options)
+
+    # ------------------------------------------------------------------
+    # ACP extension methods (underscore-prefixed wire calls)
+    # ------------------------------------------------------------------
+
+    async def ext_method(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Dispatch ACP extension requests (wire method ``_<method>``).
+
+        The SDK routes any non-standard request whose method starts with
+        ``_`` here; unknown methods answer ``method_not_found``.
+        """
+        if method != COMPRESS_METHOD:
+            raise RequestError.method_not_found(f"_{method}")
+        return await self._compress_session(params)
+
+    async def _compress_session(
+        self,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Force-compress one session's context via the engine.
+
+        Implements the ``_compress`` extension: inject a near-zero
+        ``ContextConfig`` so the engine's ratio check always passes
+        (AgentScope 2.0.5 has no force flag), making this call
+        unconditional. Serialized against ``prompt`` and concurrent
+        compression; persists the compressed state immediately.
+        """
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str):
+            raise RequestError.invalid_params(
+                {"details": "Missing sessionId"},
+            )
+        record = self._records.get(session_id)
+        if record is None:
+            raise RequestError.invalid_params(
+                {"details": f"Unknown session: {session_id!r}"},
+            )
+
+        reserve_tokens = params.get("reserveTokens")
+        if reserve_tokens is None:
+            reserve_tokens = COMPRESS_DEFAULT_RESERVE_TOKENS
+        if (
+            not isinstance(reserve_tokens, int)
+            or isinstance(reserve_tokens, bool)
+            or reserve_tokens <= 0
+        ):
+            raise RequestError.invalid_params(
+                {"details": "reserveTokens must be a positive integer"},
+            )
+        instructions_text = params.get("instructions")
+        if instructions_text is not None and (
+            not isinstance(instructions_text, str)
+            or not instructions_text.strip()
+        ):
+            raise RequestError.invalid_params(
+                {"details": "instructions must be a non-empty string"},
+            )
+
+        # Reject while a reply is streaming: the engine mutates the state
+        # mid-stream otherwise.
+        prompt_task = self._prompt_tasks.get(session_id)
+        if prompt_task is not None and not prompt_task.done():
+            raise RequestError.invalid_params(
+                {"details": "Cannot compress while a prompt is running"},
+            )
+
+        # Serialize concurrent compression requests.
+        lock = self._compress_locks.setdefault(session_id, asyncio.Lock())
+        if lock.locked():
+            raise RequestError.invalid_params(
+                {"details": "Compression already in progress"},
+            )
+        async with lock:
+            return await self._compress_session_impl(
+                record,
+                session_id,
+                reserve_tokens,
+                instructions_text,
+            )
+
+    async def _compress_session_impl(
+        self,
+        record: SessionRecord,
+        session_id: str,
+        reserve_tokens: int,
+        instructions_text: str | None,
+    ) -> dict[str, Any]:
+        """Body of ``_compress`` — runs under the per-session lock."""
+        agent = record.agent
+        state = getattr(agent, "state", None)
+        if state is None or not state.context:
+            # The engine would raise RuntimeError for this; answer with a
+            # protocol error instead.
+            raise RequestError.invalid_params(
+                {"details": "No context to compress"},
+            )
+        if state.has_awaiting_tool_calls(agent.name):
+            raise RequestError.invalid_params(
+                {
+                    "details": "Tool calls awaiting confirmation; "
+                    "finish the turn first",
+                },
+            )
+
+        context_size = int(getattr(agent.model, "context_size", 0) or 0)
+        if context_size <= 0:
+            raise RequestError.internal_error(
+                {"details": "Model does not report a context_size"},
+            )
+        # The injected trigger ratio bounds the engine's overflow fallback:
+        # when the compression input exceeds the window and the first
+        # generate call fails, the engine drops oldest messages until the
+        # input fits context_size * trigger_ratio — with the tiny ratio
+        # that means dropping almost everything. Pre-check the input size
+        # (same estimation the engine itself uses) and refuse instead.
+        trigger_tokens = int(COMPRESS_TRIGGER_RATIO * context_size)
+        if reserve_tokens >= trigger_tokens:
+            raise RequestError.invalid_params(
+                {
+                    "details": f"reserveTokens must be smaller than "
+                    f"{trigger_tokens} (the trigger threshold)",
+                },
+            )
+        reserve_ratio = reserve_tokens / context_size
+
+        kwargs = await agent._prepare_model_input()
+        estimated = await agent.model.count_tokens(**kwargs)
+        if estimated + COMPRESS_OVERFLOW_MARGIN > context_size:
+            raise RequestError.invalid_params(
+                {
+                    "details": (
+                        f"History too long to compress safely "
+                        f"(~{estimated} tokens in a {context_size}-token "
+                        f"window); trim the session first"
+                    ),
+                },
+            )
+
+        context_config = ContextConfig(
+            trigger_ratio=COMPRESS_TRIGGER_RATIO,
+            reserve_ratio=reserve_ratio,
+        )
+        instructions = (
+            HintBlock(hint=instructions_text) if instructions_text else None
+        )
+
+        before = len(state.context)
+        summary_before = state.summary
+        logger.info(
+            "compress: session=%s context_msgs=%d reserve_tokens=%d",
+            session_id,
+            before,
+            reserve_tokens,
+        )
+        try:
+            await agent.compress_context(
+                context_config=context_config,
+                instructions=instructions,
+            )
+        except RuntimeError as exc:
+            # Engine validation (e.g. the system prompt alone exceeds the
+            # threshold) — surface as an invalid request.
+            raise RequestError.invalid_params({"details": str(exc)}) from None
+        except Exception as exc:
+            # Model failures, formatter errors, ... — internal error.
+            raise RequestError.internal_error(
+                {"details": f"Compression failed: {exc}"},
+            ) from None
+
+        after = len(state.context)
+        summary_generated = (
+            bool(state.summary) and state.summary != summary_before
+        )
+        # The client may have closed the session while the compression
+        # model call was in flight; skip persistence for a dead session.
+        if self._records.get(session_id) is record:
+            record.updated_at = _now_iso()
+            self._save_state(record, session_id)
+        else:
+            logger.warning(
+                "compress: session closed mid-compression, "
+                "state not persisted: session=%s",
+                session_id,
+            )
+        logger.info(
+            "compress finished: session=%s compressed=%d reserved=%d",
+            session_id,
+            before - after,
+            after,
+        )
+        return {
+            "compressed": before != after,
+            "compressedMessages": before - after,
+            "reservedMessages": after,
+            "summaryGenerated": summary_generated,
+        }
 
     # ------------------------------------------------------------------
     # Reply-stream handling

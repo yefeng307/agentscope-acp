@@ -42,7 +42,13 @@ from agentscope.event import (
     UserInterruptEvent,
 )
 from agentscope.event._event import ToolResultState
-from agentscope.message import ToolCallBlock, ToolCallState, ToolResultBlock
+from agentscope.message import (
+    AssistantMsg,
+    ToolCallBlock,
+    ToolCallState,
+    ToolResultBlock,
+    UserMsg,
+)
 from agentscope.state import AgentState
 from agentscope.types import ReplyFinishedReason
 from pydantic import SecretStr
@@ -1381,3 +1387,338 @@ async def test_build_mcp_clients_skips_unsupported_types():
         ],
     )
     assert clients == []
+
+
+# ----------------------------------------------------------------------
+# _compress extension (ext_method)
+# ----------------------------------------------------------------------
+
+class FakeCompressModel:
+    """Fake model reporting a context window and a fixed token estimate."""
+
+    def __init__(self, context_size: int = 128000, tokens: int = 5000) -> None:
+        self.context_size = context_size
+        self.tokens = tokens
+
+    async def count_tokens(self, messages: Any, tools: Any = None) -> int:
+        return self.tokens
+
+
+class FakeCompressAgent:
+    """Fake AgentScope Agent whose ``compress_context`` truncates the
+    context, mirroring the engine contract used by ``_compress``. ``keep``
+    of ``None`` simulates a no-op compression (context already tiny)."""
+
+    name = "agentscope-acp"
+
+    def __init__(
+        self,
+        messages: int = 10,
+        keep: int | None = 3,
+        context_size: int = 128000,
+        tokens: int = 5000,
+        error: Exception | None = None,
+        sleep: float = 0.0,
+    ) -> None:
+        self.state = AgentState()
+        self.state.context = [
+            UserMsg(name="user", content=f"msg {i}")
+            for i in range(messages)
+        ]
+        self.keep = keep
+        self.error = error
+        self.sleep = sleep
+        self.model = FakeCompressModel(context_size, tokens)
+        self.compress_calls: list[tuple[Any, Any]] = []
+        self.received: list[Any] = []
+
+    async def _prepare_model_input(self) -> dict[str, Any]:
+        return {"messages": list(self.state.context), "tools": []}
+
+    async def reply_stream(self, inputs: Any = None, **kwargs: Any):
+        self.received.append(inputs)
+        return
+        yield  # pragma: no cover — makes it an async generator
+
+    async def compress_context(
+        self,
+        context_config: Any = None,
+        instructions: Any = None,
+    ) -> None:
+        self.compress_calls.append((context_config, instructions))
+        if self.sleep:
+            await asyncio.sleep(self.sleep)
+        if self.error is not None:
+            raise self.error
+        if self.keep is None:
+            return
+        self.state.context = self.state.context[-self.keep:]
+        self.state.summary = "compressed summary"
+
+
+async def test_compress_injects_low_threshold_config_and_reports_stats():
+    fake = FakeCompressAgent(messages=10, keep=3)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    result = await acp_agent.ext_method(
+        "compress",
+        {"sessionId": session.session_id},
+    )
+
+    assert result == {
+        "compressed": True,
+        "compressedMessages": 7,
+        "reservedMessages": 3,
+        "summaryGenerated": True,
+    }
+    # The injected config makes the engine's ratio check always pass and
+    # reserves the default token budget (640 / 128000).
+    config, instructions = fake.compress_calls[0]
+    assert config.trigger_ratio == 0.01
+    assert config.reserve_ratio == pytest.approx(640 / 128000)
+    assert instructions is None
+
+
+async def test_compress_reserve_tokens_and_instructions(tmp_path):
+    fake = FakeCompressAgent(messages=10, keep=2)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    result = await acp_agent.ext_method(
+        "compress",
+        {
+            "sessionId": session.session_id,
+            "reserveTokens": 1024,
+            "instructions": "preserve the TODO list",
+        },
+    )
+
+    config, instructions = fake.compress_calls[0]
+    assert config.reserve_ratio == pytest.approx(1024 / 128000)
+    assert instructions.hint == "preserve the TODO list"
+    assert result["compressedMessages"] == 8
+    assert result["reservedMessages"] == 2
+
+
+async def test_compress_persists_compressed_state(tmp_path):
+    fake = FakeCompressAgent(messages=6, keep=2)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    await acp_agent.ext_method(
+        "compress",
+        {"sessionId": session.session_id},
+    )
+
+    path = tmp_path / f"{session.session_id}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert len(payload["context"]) == 2
+    assert payload["summary"] == "compressed summary"
+    assert payload["_acp_meta"]["model_id"] == "qwen3.6-plus"
+
+
+async def test_compress_unknown_session_and_missing_id():
+    acp_agent = _make_agent(FakeCompressAgent())
+
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method("compress", {"sessionId": "nope"})
+    assert exc_info.value.code == -32602
+    assert "Unknown session" in exc_info.value.data["details"]
+
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method("compress", {})
+    assert "Missing sessionId" in exc_info.value.data["details"]
+
+
+async def test_compress_empty_context_is_rejected():
+    fake = FakeCompressAgent(messages=0, keep=0)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method(
+            "compress",
+            {"sessionId": session.session_id},
+        )
+    assert "No context to compress" in exc_info.value.data["details"]
+    assert fake.compress_calls == []
+
+
+async def test_compress_reserve_tokens_validation():
+    fake = FakeCompressAgent(messages=4, keep=1)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    for bad in (0, -5, "wide", True):
+        with pytest.raises(RequestError) as exc_info:
+            await acp_agent.ext_method(
+                "compress",
+                {"sessionId": session.session_id, "reserveTokens": bad},
+            )
+        assert "reserveTokens" in exc_info.value.data["details"]
+
+    # Above the injected trigger threshold (0.01 * 128000 = 1280).
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method(
+            "compress",
+            {"sessionId": session.session_id, "reserveTokens": 999999},
+        )
+    assert "smaller than 1280" in exc_info.value.data["details"]
+
+
+async def test_compress_history_too_long_is_rejected():
+    # Estimated input (99000) + safety margin (4096) exceeds the window.
+    fake = FakeCompressAgent(
+        messages=10,
+        keep=3,
+        context_size=100000,
+        tokens=99000,
+    )
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method(
+            "compress",
+            {"sessionId": session.session_id},
+        )
+    assert "History too long" in exc_info.value.data["details"]
+    assert fake.compress_calls == []
+
+
+async def test_compress_while_prompt_running_is_rejected():
+    fake = FakeCompressAgent(messages=4, keep=1)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    parked = asyncio.ensure_future(asyncio.sleep(3600))
+    acp_agent._prompt_tasks[session.session_id] = parked
+    try:
+        with pytest.raises(RequestError) as exc_info:
+            await acp_agent.ext_method(
+                "compress",
+                {"sessionId": session.session_id},
+            )
+        assert "prompt is running" in exc_info.value.data["details"]
+    finally:
+        parked.cancel()
+        acp_agent._prompt_tasks.pop(session.session_id, None)
+
+
+async def test_compress_serializes_concurrent_requests():
+    fake = FakeCompressAgent(messages=10, keep=3, sleep=0.2)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    first = asyncio.create_task(
+        acp_agent.ext_method("compress", {"sessionId": session.session_id}),
+    )
+    await asyncio.sleep(0.02)
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method(
+            "compress",
+            {"sessionId": session.session_id},
+        )
+    assert "already in progress" in exc_info.value.data["details"]
+
+    result = await first
+    assert result["compressed"] is True
+    assert len(fake.compress_calls) == 1
+
+
+async def test_compress_engine_errors_map_to_protocol_errors():
+    for error, code in (
+        (RuntimeError("system prompt exceeds threshold"), -32602),
+        (ValueError("model blew up"), -32603),
+    ):
+        fake = FakeCompressAgent(messages=4, keep=1, error=error)
+        acp_agent = _make_agent(fake)
+        session = await acp_agent.new_session(cwd="/tmp")
+
+        with pytest.raises(RequestError) as exc_info:
+            await acp_agent.ext_method(
+                "compress",
+                {"sessionId": session.session_id},
+            )
+        assert exc_info.value.code == code
+        assert str(error) in exc_info.value.data["details"]
+
+
+async def test_compress_engine_noop_reports_uncompressed():
+    fake = FakeCompressAgent(messages=4, keep=None)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    result = await acp_agent.ext_method(
+        "compress",
+        {"sessionId": session.session_id},
+    )
+
+    assert result == {
+        "compressed": False,
+        "compressedMessages": 0,
+        "reservedMessages": 4,
+        "summaryGenerated": False,
+    }
+
+
+async def test_compress_awaiting_tool_calls_is_rejected():
+    fake = FakeCompressAgent(messages=4, keep=1)
+    fake.state.context.append(
+        AssistantMsg(
+            name=fake.name,
+            content=[
+                ToolCallBlock(
+                    id="c1",
+                    name="Bash",
+                    input="{}",
+                    state=ToolCallState.ASKING,
+                ),
+            ],
+        ),
+    )
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method(
+            "compress",
+            {"sessionId": session.session_id},
+        )
+    assert "awaiting confirmation" in exc_info.value.data["details"]
+    assert fake.compress_calls == []
+
+
+async def test_ext_method_unknown_is_method_not_found():
+    acp_agent = _make_agent(FakeCompressAgent())
+
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method("frobnicate", {})
+    assert exc_info.value.code == -32601
+    assert exc_info.value.data["method"] == "_frobnicate"
+
+
+async def test_prompt_waits_for_inflight_compression():
+    fake = FakeCompressAgent(messages=10, keep=3, sleep=0.15)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    compress_task = asyncio.create_task(
+        acp_agent.ext_method("compress", {"sessionId": session.session_id}),
+    )
+    await asyncio.sleep(0.02)
+    prompt_task = asyncio.create_task(
+        acp_agent.prompt(
+            prompt=_prompt_blocks("hi"),
+            session_id=session.session_id,
+        ),
+    )
+    # The prompt is parked behind the compression lock: no reply yet.
+    await asyncio.sleep(0.05)
+    assert fake.received == []
+
+    await compress_task
+    response = await prompt_task
+    assert response.stop_reason == "end_turn"
+    assert len(fake.received) == 1
