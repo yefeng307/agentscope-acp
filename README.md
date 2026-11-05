@@ -39,77 +39,7 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `session/close` | ✅ | 取消进行中 prompt + 删除磁盘状态 + 断开 MCP |
 | `session/resume` | ✅ | 重新挂接已存在会话（内存 → 磁盘 → 新建降级链） |
 | MCP 集成 | ✅ | `session/new` 的 mcp_servers（stdio/http）→ 引擎 MCPClient |
-| `_compress`（扩展） | ✅ | 主动强制压缩会话上下文（调用即压缩，详见下方「上下文压缩扩展」章节） |
-
-## 上下文压缩扩展（`_compress`）
-
-标准 ACP 没有压缩方法，本项目通过扩展方法（wire 名 `_compress`）把 AgentScope 的
-`compress_context()` 暴露给客户端，**调用即压缩**，不需要等上下文涨到自动阈值。
-
-引擎（AgentScope 2.0.5）的 `compress_context` 内部有 `trigger_ratio × context_size`
-阈值判断且没有 `force` 参数；本实现按调用注入
-`ContextConfig(trigger_ratio=0.01, reserve_ratio=reserveTokens / context_size)`，
-使判断必然通过。该配置只作本次调用参数传入、不写回 Agent，之后对话的自动压缩
-仍按默认阈值（0.8 / 0.1）工作。
-
-### 请求 / 响应
-
-```jsonc
-// 请求（JSON-RPC method = "_compress"）
-{
-  "sessionId": "85ca84cb...",              // 必填：目标会话
-  "reserveTokens": 640,                     // 可选：尾部保留的 token 预算，默认 640
-  "instructions": "重点保留未完成的 TODO"   // 可选：给摘要模型的额外指示
-}
-
-// 响应
-{
-  "compressed": true,          // 是否实际发生了压缩（上下文极小时可能为 false）
-  "compressedMessages": 12,    // 被压缩的消息条数
-  "reservedMessages": 3,       // 保留在上下文尾部的消息条数
-  "summaryGenerated": true     // 是否生成了新摘要
-}
-```
-
-- `reserveTokens` 必须为正整数且小于 `0.01 × context_size`（默认窗口 128000 时
-  即小于 1280），超出返回 `invalid_params`；映射为
-  `reserve_ratio = reserveTokens / context_size`
-- `instructions` 以 HintBlock 注入摘要上下文，用于引导摘要关注点
-
-### 调用方式
-
-ACP Python SDK 客户端（`acp.client` 的 connection 自带 `ext_method`）：
-
-```python
-result = await conn.ext_method("compress", {"sessionId": session_id})
-```
-
-或直接走 JSON-RPC（stdio 每行一条）：
-
-```jsonc
-{"jsonrpc":"2.0","id":4,"method":"_compress","params":{"sessionId":"<id>"}}
-```
-
-### 行为与限制
-
-- 压缩完成后 `state.summary` 被替换为五字段结构化摘要（任务概述 / 当前状态 /
-  关键发现 / 后续步骤 / 需保留上下文），`state.context` 截断为尾部保留消息；
-  后续每次模型请求为 system prompt + summary + 精简 context
-- 压缩本身消耗一次模型调用（用会话当前模型生成结构化摘要），通常耗时数秒到
-  数十秒；客户端请求超时应留足余量
-- 与 prompt 互斥：prompt 进行中调用返回 `invalid_params`（"Cannot compress while
-  a prompt is running"）；压缩进行中到达的 prompt 会等待压缩完成后再开始
-- 同一会话并发压缩串行：第二次调用返回 `invalid_params`
-- 小会话可能 `reservedMessages=0`：全部消息总量不足 `reserveTokens` 时，引擎会
-  fallback 到不保留（否则无内容可压），整段历史被摘要替换
-- 历史过长（估算输入 + 4096 安全余量超过 `context_size`）时直接返回
-  `invalid_params`，拒绝进入引擎的 overflow 降级分支（该分支会大量丢弃旧消息、
-  损害摘要质量）
-- 压缩成功后立即持久化到会话 JSON（`AGENTSCOPE_ACP_SESSIONS_DIR`），进程重启
-  不丢失
-- 空上下文、存在等待确认的工具调用时返回 `invalid_params`；摘要模型调用失败
-  返回 `internal_error`
-
+| `_compress`（扩展） | ✅ | 主动强制压缩会话上下文（调用即压缩，详见「上下文压缩扩展」章节） |
 
 ## 环境变量
 
@@ -207,6 +137,75 @@ skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
 软链条目（agent-work 的技能分发机制）均可被发现；`name`/`description`
 注入系统提示词（渐进式披露：全文本体按需通过内置 `skill_viewer` 工具读取）。
 目录不存在时仅记录警告、按无 skill 启动，不会崩溃。
+
+## 上下文压缩扩展（`_compress`）
+
+标准 ACP 没有压缩方法，本项目通过扩展方法（wire 名 `_compress`）把 AgentScope 的
+`compress_context()` 暴露给客户端，**调用即压缩**，不需要等上下文涨到自动阈值。
+
+引擎（AgentScope 2.0.5）的 `compress_context` 内部有 `trigger_ratio × context_size`
+阈值判断且没有 `force` 参数；本实现按调用注入
+`ContextConfig(trigger_ratio=0.01, reserve_ratio=reserveTokens / context_size)`，
+使判断必然通过。该配置只作本次调用参数传入、不写回 Agent，之后对话的自动压缩
+仍按默认阈值（0.8 / 0.1）工作。
+
+### 请求 / 响应
+
+```jsonc
+// 请求（JSON-RPC method = "_compress"）
+{
+  "sessionId": "85ca84cb...",              // 必填：目标会话
+  "reserveTokens": 640,                     // 可选：尾部保留的 token 预算，默认 640
+  "instructions": "重点保留未完成的 TODO"   // 可选：给摘要模型的额外指示
+}
+
+// 响应
+{
+  "compressed": true,          // 是否实际发生了压缩（上下文极小时可能为 false）
+  "compressedMessages": 12,    // 被压缩的消息条数
+  "reservedMessages": 3,       // 保留在上下文尾部的消息条数
+  "summaryGenerated": true     // 是否生成了新摘要
+}
+```
+
+- `reserveTokens` 必须为正整数且小于 `0.01 × context_size`（默认窗口 128000 时
+  即小于 1280），超出返回 `invalid_params`；映射为
+  `reserve_ratio = reserveTokens / context_size`
+- `instructions` 以 HintBlock 注入摘要上下文，用于引导摘要关注点
+
+### 调用方式
+
+ACP Python SDK 客户端（`acp.client` 的 connection 自带 `ext_method`）：
+
+```python
+result = await conn.ext_method("compress", {"sessionId": session_id})
+```
+
+或直接走 JSON-RPC（stdio 每行一条）：
+
+```jsonc
+{"jsonrpc":"2.0","id":4,"method":"_compress","params":{"sessionId":"<id>"}}
+```
+
+### 行为与限制
+
+- 压缩完成后 `state.summary` 被替换为五字段结构化摘要（任务概述 / 当前状态 /
+  关键发现 / 后续步骤 / 需保留上下文），`state.context` 截断为尾部保留消息；
+  后续每次模型请求为 system prompt + summary + 精简 context
+- 压缩本身消耗一次模型调用（用会话当前模型生成结构化摘要），通常耗时数秒到
+  数十秒；客户端请求超时应留足余量
+- 与 prompt 互斥：prompt 进行中调用返回 `invalid_params`（"Cannot compress while
+  a prompt is running"）；压缩进行中到达的 prompt 会等待压缩完成后再开始
+- 同一会话并发压缩串行：第二次调用返回 `invalid_params`
+- 小会话可能 `reservedMessages=0`：全部消息总量不足 `reserveTokens` 时，引擎会
+  fallback 到不保留（否则无内容可压），整段历史被摘要替换
+- 历史过长（估算输入 + 4096 安全余量超过 `context_size`）时直接返回
+  `invalid_params`，拒绝进入引擎的 overflow 降级分支（该分支会大量丢弃旧消息、
+  损害摘要质量）
+- 压缩成功后立即持久化到会话 JSON（`AGENTSCOPE_ACP_SESSIONS_DIR`），进程重启
+  不丢失
+- 空上下文、存在等待确认的工具调用时返回 `invalid_params`；摘要模型调用失败
+  返回 `internal_error`
 
 ## 快速开始
 
