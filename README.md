@@ -169,8 +169,7 @@ skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
 ```
 
 - `reserveTokens` 必须为正整数且小于 `0.01 × context_size`（默认窗口 128000 时
-  即小于 1280），超出返回 `invalid_params`；映射为
-  `reserve_ratio = reserveTokens / context_size`
+  即小于 1280），超出返回 `invalid_params`
 - `instructions` 以 HintBlock 注入摘要上下文，用于引导摘要关注点
 
 ### 调用方式
