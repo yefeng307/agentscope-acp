@@ -194,18 +194,6 @@ result = await conn.ext_method("compress", {"sessionId": session_id})
   后续每次模型请求为 system prompt + summary + 精简 context
 - 压缩本身消耗一次模型调用（用会话当前模型生成结构化摘要），通常耗时数秒到
   数十秒；客户端请求超时应留足余量
-- 与 prompt 互斥：prompt 进行中调用返回 `invalid_params`（"Cannot compress while
-  a prompt is running"）；压缩进行中到达的 prompt 会等待压缩完成后再开始
-- 同一会话并发压缩串行：第二次调用返回 `invalid_params`
-- 小会话可能 `reservedMessages=0`：全部消息总量不足 `reserveTokens` 时，引擎会
-  fallback 到不保留（否则无内容可压），整段历史被摘要替换
-- 历史过长（估算输入 + 4096 安全余量超过 `context_size`）时直接返回
-  `invalid_params`，拒绝进入引擎的 overflow 降级分支（该分支会大量丢弃旧消息、
-  损害摘要质量）
-- 压缩成功后立即持久化到会话 JSON（`AGENTSCOPE_ACP_SESSIONS_DIR`），进程重启
-  不丢失
-- 空上下文、存在等待确认的工具调用时返回 `invalid_params`；摘要模型调用失败
-  返回 `internal_error`
 
 ## 快速开始
 
