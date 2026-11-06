@@ -1456,7 +1456,7 @@ class FakeCompressAgent:
         self.state.summary = "compressed summary"
 
 
-async def test_compress_injects_low_threshold_config_and_reports_stats():
+async def test_compress_uses_default_trigger_and_reports_stats():
     fake = FakeCompressAgent(messages=10, keep=3)
     acp_agent = _make_agent(fake)
     session = await acp_agent.new_session(cwd="/tmp")
@@ -1472,12 +1472,61 @@ async def test_compress_injects_low_threshold_config_and_reports_stats():
         "reservedMessages": 3,
         "summaryGenerated": True,
     }
-    # The injected config makes the engine's ratio check always pass and
-    # reserves the default token budget (640 / 128000).
+    # Without triggerRatio the engine's own threshold applies (0.8); the
+    # reserved budget defaults to 640 / 128000.
     config, instructions = fake.compress_calls[0]
-    assert config.trigger_ratio == 0.01
+    assert config.trigger_ratio == 0.8
     assert config.reserve_ratio == pytest.approx(640 / 128000)
     assert instructions is None
+
+
+async def test_compress_custom_trigger_ratio_is_forwarded():
+    fake = FakeCompressAgent(messages=10, keep=3)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    result = await acp_agent.ext_method(
+        "compress",
+        {"sessionId": session.session_id, "triggerRatio": 0.01},
+    )
+
+    assert result["compressed"] is True
+    config, _ = fake.compress_calls[0]
+    assert config.trigger_ratio == 0.01
+
+    # The reserve budget is bounded by the custom threshold: 0.01 * 128000.
+    with pytest.raises(RequestError) as exc_info:
+        await acp_agent.ext_method(
+            "compress",
+            {
+                "sessionId": session.session_id,
+                "triggerRatio": 0.01,
+                "reserveTokens": 1280,
+            },
+        )
+    assert "smaller than 1280" in exc_info.value.data["details"]
+
+
+async def test_compress_trigger_ratio_validation():
+    fake = FakeCompressAgent(messages=4, keep=1)
+    acp_agent = _make_agent(fake)
+    session = await acp_agent.new_session(cwd="/tmp")
+
+    for bad in (0, 0.9, 1, -0.1, "low", True):
+        with pytest.raises(RequestError) as exc_info:
+            await acp_agent.ext_method(
+                "compress",
+                {"sessionId": session.session_id, "triggerRatio": bad},
+            )
+        assert "triggerRatio" in exc_info.value.data["details"]
+    assert fake.compress_calls == []
+
+    result = await acp_agent.ext_method(
+        "compress",
+        {"sessionId": session.session_id, "triggerRatio": 0.5},
+    )
+    assert result["compressed"] is True
+    assert fake.compress_calls[0][0].trigger_ratio == 0.5
 
 
 async def test_compress_reserve_tokens_and_instructions(tmp_path):
@@ -1558,13 +1607,13 @@ async def test_compress_reserve_tokens_validation():
             )
         assert "reserveTokens" in exc_info.value.data["details"]
 
-    # Above the injected trigger threshold (0.01 * 128000 = 1280).
+    # Above the default trigger threshold (0.8 * 128000 = 102400).
     with pytest.raises(RequestError) as exc_info:
         await acp_agent.ext_method(
             "compress",
             {"sessionId": session.session_id, "reserveTokens": 999999},
         )
-    assert "smaller than 1280" in exc_info.value.data["details"]
+    assert "smaller than 102400" in exc_info.value.data["details"]
 
 
 async def test_compress_history_too_long_is_rejected():

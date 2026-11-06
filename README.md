@@ -39,7 +39,7 @@ agent-work (ACP Client)                     agentscope-acp (本项目)
 | `session/close` | ✅ | 取消进行中 prompt + 删除磁盘状态 + 断开 MCP |
 | `session/resume` | ✅ | 重新挂接已存在会话（内存 → 磁盘 → 新建降级链） |
 | MCP 集成 | ✅ | `session/new` 的 mcp_servers（stdio/http）→ 引擎 MCPClient |
-| `_compress`（扩展） | ✅ | 主动强制压缩会话上下文（调用即压缩，详见「上下文压缩扩展」章节） |
+| `_compress`（扩展） | ✅ | 主动触发会话上下文压缩（`triggerRatio` 控制阈值，传小值即强制压缩） |
 
 ## 环境变量
 
@@ -141,13 +141,14 @@ skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
 ## 上下文压缩扩展（`_compress`）
 
 标准 ACP 没有压缩方法，本项目通过扩展方法（wire 名 `_compress`）把 AgentScope 的
-`compress_context()` 暴露给客户端，**调用即压缩**，不需要等上下文涨到自动阈值。
+`compress_context()` 暴露给客户端：调用即触发一次压缩尝试，是否真的压缩由
+`triggerRatio` 决定（默认 0.8 与引擎一致；传小值即强制压缩）。
 
 引擎（AgentScope 2.0.5）的 `compress_context` 内部有 `trigger_ratio × context_size`
 阈值判断且没有 `force` 参数；本实现按调用注入
-`ContextConfig(trigger_ratio=0.01, reserve_ratio=reserveTokens / context_size)`，
-使判断必然通过。该配置只作本次调用参数传入、不写回 Agent，之后对话的自动压缩
-仍按默认阈值（0.8 / 0.1）工作。
+`ContextConfig(trigger_ratio=triggerRatio, reserve_ratio=reserveTokens / context_size)`。
+该配置只作本次调用参数传入、不写回 Agent，之后对话的自动压缩仍按默认阈值
+（0.8 / 0.1）工作。
 
 ### 请求 / 响应
 
@@ -155,21 +156,26 @@ skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
 // 请求（JSON-RPC method = "_compress"）
 {
   "sessionId": "85ca84cb...",              // 必填：目标会话
+  "triggerRatio": 0.01,                     // 可选：触发阈值，默认 0.8；传 0.01 即必压缩
   "reserveTokens": 640,                     // 可选：尾部保留的 token 预算，默认 640
   "instructions": "重点保留未完成的 TODO"   // 可选：给摘要模型的额外指示
 }
 
 // 响应
 {
-  "compressed": true,          // 是否实际发生了压缩（上下文极小时可能为 false）
+  "compressed": true,          // 是否实际发生了压缩（未达阈值时为 false）
   "compressedMessages": 12,    // 被压缩的消息条数
   "reservedMessages": 3,       // 保留在上下文尾部的消息条数
   "summaryGenerated": true     // 是否生成了新摘要
 }
 ```
 
-- `reserveTokens` 必须为正整数且小于 `0.01 × context_size`（默认窗口 128000 时
-  即小于 1280），超出返回 `invalid_params`
+- `triggerRatio` 可选，取值 `(0, 0.9)`，默认 `0.8`（引擎默认值）；上下文估算
+  token 低于 `triggerRatio × context_size` 时引擎按阈值跳过压缩（响应
+  `compressed: false`）；想让本次调用必定压缩，传接近 0 的值（如 `0.01`，默认
+  窗口 128000 下阈值 1280 token，任何有内容的会话都会触发）
+- `reserveTokens` 必须为正整数且小于 `triggerRatio × context_size`，超出返回
+  `invalid_params`
 - `instructions` 以 HintBlock 注入摘要上下文，用于引导摘要关注点
 
 ### 调用方式
@@ -177,13 +183,17 @@ skills/                  ← AGENTSCOPE_ACP_SKILLS_DIR 指向这里
 ACP Python SDK 客户端（`acp.client` 的 connection 自带 `ext_method`）：
 
 ```python
-result = await conn.ext_method("compress", {"sessionId": session_id})
+# 强制压缩：传接近 0 的 triggerRatio
+result = await conn.ext_method(
+    "compress",
+    {"sessionId": session_id, "triggerRatio": 0.01},
+)
 ```
 
 或直接走 JSON-RPC（stdio 每行一条）：
 
 ```jsonc
-{"jsonrpc":"2.0","id":4,"method":"_compress","params":{"sessionId":"<id>"}}
+{"jsonrpc":"2.0","id":4,"method":"_compress","params":{"sessionId":"<id>","triggerRatio":0.01}}
 ```
 
 ### 行为与限制

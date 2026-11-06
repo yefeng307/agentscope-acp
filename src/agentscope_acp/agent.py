@@ -93,10 +93,11 @@ USER_NAME = "user"
 CONFIG_OPTION_MODEL = "model"
 
 # Context-compression extension ("_compress" wire method). AgentScope 2.0.5
-# has no force flag, so a near-zero trigger ratio is injected per call to
-# make the engine's ratio check always pass.
+# has no force flag, so the trigger ratio is a per-call parameter: the
+# default matches the engine's own (0.8, compress past 80% of the window);
+# callers force compression by passing a tiny value (e.g. 0.01).
 COMPRESS_METHOD = "compress"
-COMPRESS_TRIGGER_RATIO = 0.01
+COMPRESS_DEFAULT_TRIGGER_RATIO = 0.8
 COMPRESS_DEFAULT_RESERVE_TOKENS = 640
 COMPRESS_OVERFLOW_MARGIN = 4096
 
@@ -840,13 +841,14 @@ class AgentScopeAcpAgent(Agent):
         self,
         params: dict[str, Any],
     ) -> dict[str, Any]:
-        """Force-compress one session's context via the engine.
+        """Compress one session's context via the engine.
 
-        Implements the ``_compress`` extension: inject a near-zero
-        ``ContextConfig`` so the engine's ratio check always passes
-        (AgentScope 2.0.5 has no force flag), making this call
-        unconditional. Serialized against ``prompt`` and concurrent
-        compression; persists the compressed state immediately.
+        Implements the ``_compress`` extension: ``triggerRatio`` picks the
+        engine's threshold (default 0.8, the engine's own); passing a tiny
+        ratio (e.g. 0.01) makes the ratio check always pass, forcing the
+        compression. The injected ``ContextConfig`` is per-call and never
+        written back to the agent. Serialized against ``prompt`` and
+        concurrent compression; persists the compressed state immediately.
         """
         session_id = params.get("sessionId")
         if not isinstance(session_id, str):
@@ -858,6 +860,19 @@ class AgentScopeAcpAgent(Agent):
             raise RequestError.invalid_params(
                 {"details": f"Unknown session: {session_id!r}"},
             )
+
+        trigger_ratio = params.get("triggerRatio")
+        if trigger_ratio is None:
+            trigger_ratio = COMPRESS_DEFAULT_TRIGGER_RATIO
+        if (
+            not isinstance(trigger_ratio, (int, float))
+            or isinstance(trigger_ratio, bool)
+            or not 0 < trigger_ratio < 0.9
+        ):
+            raise RequestError.invalid_params(
+                {"details": "triggerRatio must be a number in (0, 0.9)"},
+            )
+        trigger_ratio = float(trigger_ratio)
 
         reserve_tokens = params.get("reserveTokens")
         if reserve_tokens is None:
@@ -899,6 +914,7 @@ class AgentScopeAcpAgent(Agent):
                 session_id,
                 reserve_tokens,
                 instructions_text,
+                trigger_ratio,
             )
 
     async def _compress_session_impl(
@@ -907,6 +923,7 @@ class AgentScopeAcpAgent(Agent):
         session_id: str,
         reserve_tokens: int,
         instructions_text: str | None,
+        trigger_ratio: float,
     ) -> dict[str, Any]:
         """Body of ``_compress`` — runs under the per-session lock."""
         agent = record.agent
@@ -930,13 +947,13 @@ class AgentScopeAcpAgent(Agent):
             raise RequestError.internal_error(
                 {"details": "Model does not report a context_size"},
             )
-        # The injected trigger ratio bounds the engine's overflow fallback:
-        # when the compression input exceeds the window and the first
-        # generate call fails, the engine drops oldest messages until the
-        # input fits context_size * trigger_ratio — with the tiny ratio
-        # that means dropping almost everything. Pre-check the input size
-        # (same estimation the engine itself uses) and refuse instead.
-        trigger_tokens = int(COMPRESS_TRIGGER_RATIO * context_size)
+        # The trigger ratio bounds the engine's overflow fallback: when the
+        # compression input exceeds the window and the first generate call
+        # fails, the engine drops oldest messages until the input fits
+        # context_size * trigger_ratio — with a tiny ratio that means
+        # dropping almost everything. Pre-check the input size (same
+        # estimation the engine itself uses) and refuse instead.
+        trigger_tokens = int(trigger_ratio * context_size)
         if reserve_tokens >= trigger_tokens:
             raise RequestError.invalid_params(
                 {
@@ -960,7 +977,7 @@ class AgentScopeAcpAgent(Agent):
             )
 
         context_config = ContextConfig(
-            trigger_ratio=COMPRESS_TRIGGER_RATIO,
+            trigger_ratio=trigger_ratio,
             reserve_ratio=reserve_ratio,
         )
         instructions = (
@@ -970,10 +987,12 @@ class AgentScopeAcpAgent(Agent):
         before = len(state.context)
         summary_before = state.summary
         logger.info(
-            "compress: session=%s context_msgs=%d reserve_tokens=%d",
+            "compress: session=%s context_msgs=%d reserve_tokens=%d "
+            "trigger_ratio=%s",
             session_id,
             before,
             reserve_tokens,
+            trigger_ratio,
         )
         try:
             await agent.compress_context(
